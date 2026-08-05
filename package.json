@@ -1,0 +1,46 @@
+{
+  "name": "@shinynito/pi-menshen",
+  "version": "1.0.0",
+  "description": "pi extension: permission gate with auto-review mode (tree-sitter bash parsing)",
+  "type": "module",
+  "keywords": ["pi-package", "pi", "pi-extension", "permission", "security", "guardrail"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ShinyNito/pi-menshen.git"
+  },
+  "files": [
+    "index.ts",
+    "rules.ts",
+    "bash.ts",
+    "parser.ts",
+    "classifier.ts",
+    "config.ts",
+    "tree-sitter-bash.wasm",
+    "README.md",
+    "README_zh.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "dependencies": {
+    "web-tree-sitter": "^0.26.11"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "scripts": {
+    "test": "node --experimental-strip-types --test tests.test.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "pi": {
+    "extensions": ["./index.ts"]
+  }
+}

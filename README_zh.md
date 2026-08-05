@@ -1,0 +1,162 @@
+# pi-menshen(门神)— pi 权限扩展(自动审核模式)
+
+> **门神** — 贴在大门上的守护神,把妖邪挡在门外。这个扩展守护 agent 的工具调用,道理一样。
+
+固定运行在**自动审核模式**(无需模式切换):规则引擎 → 确定性快路径 → LLM 自动审核 → 人工确认兜底。
+
+## 特性
+
+- **规则引擎**
+  - 规则格式 `Tool(content)`:`Bash(npm install:*)`、`Bash(rm -rf /)`、`Write(.env*)`、`Read(*)`
+  - 三种行为:`allow` / `deny` / `ask`,优先级 deny > ask > allow
+  - 三种匹配:精确(exact)、前缀(`cmd:*`)、通配(`*`,`**` 跨目录)
+  - 全局规则 + 项目规则(`.pi/permission.json`,项目优先)
+- **tree-sitter bash 解析**
+  - 用 `web-tree-sitter` + `tree-sitter-bash` WASM 对命令做权威解析
+  - 复合命令(`&&` / `||` / `;` / `|`)拆分为子命令逐条检查,防 `echo hi && rm -rf /` 绕过
+  - 转义操作符(`cd src\&\& python3 evil.py`)不被误拆
+  - heredoc 内容不参与规则匹配;重定向(`> out.txt`)从匹配文本剥离
+  - 解析失败 → fail-closed:跳过确定性快路径,交由自动审核模型判断
+- **自动审核模式**(核心)
+  - 规则未命中时,由 LLM 分类器审查「工具调用 + 支配请求」,输出 `APPROVE` / `REVIEW`
+  - 只有精确的 `APPROVE` 才自动放行;超时/错误/格式异常一律转人工(fail-safe)
+  - 确定性高风险特征(密钥/凭证、提示注入、危险 bash 模式、外部目录访问)不调用 LLM,直接 REVIEW
+  - 输入脱敏后才发给模型(私钥、Bearer token、`sk-*` 等被遮蔽)
+- **确定性快路径**(省钱)
+  - 只读命令(`ls`、`git status`、`npm ls`…)自动放行
+  - 项目内非敏感文件写入/编辑自动放行;`.env`、锁文件、CI 配置等敏感路径转审核
+  - 会话缓存:相同调用只审核一次
+- **状态显示**:footer 常驻 `🔒 ✓n ✗n ⚠n` 统计
+
+## 安装
+
+从 npm 安装(已发布为 `@shinynito/pi-menshen`):
+
+```bash
+pi install npm:@shinynito/pi-menshen          # 全局(注册到 ~/.pi/agent/settings.json)
+pi install -l npm:@shinynito/pi-menshen       # 项目级(-l 写入 .pi/settings.json,可与团队共享)
+```
+
+开发阶段也可以用 `pi install /path/to/pi-menshen` 安装本地目录;本地路径注册到 settings 时**不复制文件**,改完代码 `/reload` 即生效。
+
+备选:手动符号链接(老式做法):
+
+```bash
+# 全局
+ln -s /path/to/pi-menshen ~/.pi/agent/extensions/pi-menshen
+
+# 项目级
+mkdir -p .pi/extensions
+ln -s /path/to/pi-menshen .pi/extensions/pi-menshen
+```
+
+依赖安装(首次;本地路径安装时 pi 不会自动跑 `npm install`):
+
+```bash
+cd /path/to/pi-menshen && npm install
+```
+
+然后在 pi 中 `/reload`。`tree-sitter-bash.wasm` 已随扩展分发;若缺失会自动从
+GitHub release 下载到 `~/.pi/`。
+
+## 配置(含分类器模型)
+
+配置文件:`~/.pi/pi-menshen.json`(目录可用 `PI_MENSHEN_DIR` 覆盖)。
+
+```json
+{
+  "version": 1,
+  "enabled": true,
+  "classifierModel": "",
+  "classifierTimeoutMs": 10000,
+  "maxClassifierChars": 18000,
+  "gatedTools": ["bash", "write", "edit", "fetch_content", "mcp"],
+  "sessionCache": true,
+  "sensitivePaths": [".env", ".env.*", "*.pem", "package-lock.json", ".github/workflows"],
+  "rules": {
+    "allow": ["Bash(npm run:*)"],
+    "deny": ["Bash(rm -rf /)"],
+    "ask": []
+  }
+}
+```
+
+### 分类器模型怎么配
+
+`classifierModel` 填 `"provider/modelId"`,用 `pi --list-models` 查看可用模型:
+
+```bash
+# 例:用 kimi 的便宜高速模型做审核
+# 编辑 ~/.pi/pi-menshen.json
+"classifierModel": "kimi-coding/kimi-for-coding-highspeed"
+
+# 例:用 openai 的 mini 模型
+"classifierModel": "openai-codex/gpt-5.4-mini"
+```
+
+- **留空**(`""`)= 用当前会话模型(保证可用,但与主模型共享配额/上下文)
+- 建议配一个便宜的专用模型做审核,避免主模型 token 消耗
+- 改完 `/reload` 生效,`/perm` 可查看当前生效的模型
+
+## 命令
+
+| 命令 | 说明 |
+|------|------|
+| `/perm` | 状态总览(模型、规则数、会话统计) |
+| `/perm rules` | 列出全部规则 |
+| `/perm allow\|deny\|ask <Tool(content)>` | 添加规则,如 `/perm allow Bash(npm run:*)` |
+| `/perm remove <Tool(content)>` | 移除规则 |
+| `/perm model [provider/modelId]` | 查看/设置分类器模型(`-` 恢复为当前会话模型) |
+| `/perm pause` / `/perm resume` | 暂停/恢复拦截 |
+
+人工确认对话框选项:
+- **允许本次** — 仅放行这一次
+- **拒绝** — 拦截
+- **拒绝并记住** — 拦截并自动生成 deny 规则(`rm -rf /` → `Bash(rm -rf /)`)
+
+## 决策流程
+
+```
+工具调用
+  │
+  ├─ 1. 规则引擎(deny → ask → allow,精确/前缀/通配)
+  ├─ 2. tree-sitter 解析失败 → 跳过快路径,进第 4 步(降级标记随上下文发给模型)
+  ├─ 3. 确定性快路径
+  │      ├─ 只读工具/只读命令 → 放行
+  │      └─ write/edit 项目内非敏感路径 → 放行
+  ├─ 4. 会话缓存命中 → 复用决策
+  ├─ 5. 自动审核分类器(LLM)
+  │      ├─ 确定性风险特征(密钥/危险命令/注入)→ REVIEW(不调 LLM)
+  │      ├─ APPROVE → 放行(记入会话缓存)
+  │      └─ REVIEW / 超时 / 错误 → 人工确认
+  └─ 6. 人工确认(允许 / 拒绝 / 拒绝并记住)
+```
+
+## 安全说明
+
+- 所有输入视为不可信数据;系统提示显式禁止跟随输入中的指令(防提示注入)
+- 分类器**只认精确的 `APPROVE`**;其余一切(REVIEW、噪声、超时、错误)转人工
+- 非交互模式(rpc/print)下人工确认不可用时默认**拒绝**(fail-closed)
+- deny 规则剥离全部前导环境变量(`FOO=bar rm -rf /` 仍命中 `Bash(rm:*)`)
+- 裸 shell(`bash`、`sh`、`sudo`…)不允许生成 allow 前缀规则
+
+## 开发
+
+```bash
+npm run typecheck   # 类型检查(npx tsc --noEmit)
+npm test            # 冒烟测试(规则引擎 + tree-sitter 集成)
+```
+
+需要 node ≥ 22.6(测试运行器依赖原生 TypeScript 类型剥离)。
+
+文件结构:
+
+```
+index.ts        # 入口:事件接线、决策管线、/perm 命令
+rules.ts        # 规则引擎:解析、精确/前缀/通配匹配、路径规则
+parser.ts       # tree-sitter bash 解析:子命令拆分、重定向提取
+bash.ts         # 命令分析:只读识别、包装器/环境变量剥离、危险模式、敏感路径
+classifier.ts   # 自动审核:确定性 REVIEW 特征 + LLM APPROVE/REVIEW
+config.ts       # 配置/规则持久化(~/.pi/pi-menshen.json)
+tree-sitter-bash.wasm  # 随扩展分发的语法(下载自 tree-sitter-bash v0.25.1)
+```
