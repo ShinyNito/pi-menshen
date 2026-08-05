@@ -160,7 +160,7 @@ rules.ts        # rule engine: parsing, exact/prefix/wildcard matching, path rul
 parser.ts       # tree-sitter bash parsing: sub-command splitting, redirection extraction
 bash.ts         # command analysis: read-only detection, wrapper/env stripping, danger patterns, sensitive paths
 classifier.ts   # Guardian auto-review: transcript reconstruction, structured JSON, read-only checks, retry, reviewer session
-policy.md       # review policy (risk taxonomy + output contract), shipped to the reviewer as system prompt
+policy.ts       # review policy (risk taxonomy + output contract), shipped to the reviewer as system prompt
 config.ts       # config/rule persistence (~/.pi/pi-menshen.json)
 tree-sitter-bash.wasm  # shipped grammar (downloaded from tree-sitter-bash v0.25.1)
 ```

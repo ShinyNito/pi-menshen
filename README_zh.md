@@ -179,7 +179,7 @@ rules.ts        # 规则引擎:解析、精确/前缀/通配匹配、路径规�
 parser.ts       # tree-sitter bash 解析:子命令拆分、重定向提取
 bash.ts         # 命令分析:只读识别、包装器/环境变量剥离、危险模式、敏感路径
 classifier.ts   # Guardian 自动审核:transcript 重建、结构化 JSON、只读查证、重试、审核会话复用
-policy.md       # 审核策略(风险分类学 + 输出契约),作为 system prompt 发给审核模型
+policy.ts       # 审核策略(风险分类学 + 输出契约),作为 system prompt 发给审核模型
 config.ts       # 配置/规则持久化(~/.pi/pi-menshen.json)
 tree-sitter-bash.wasm  # 随扩展分发的语法(下载自 tree-sitter-bash v0.25.1)
 ```

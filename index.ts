@@ -51,6 +51,7 @@ import {
   createReviewerSession,
   type ClassifierResult,
   type GuardianAssessment,
+  type ReviewPhase,
   type ReviewerSessionState,
 } from "./classifier.ts";
 
@@ -242,6 +243,7 @@ async function decideToolCall(
       session: state.reviewer,
       maxAttempts: state.config.guardian.maxAttempts,
       maxChecks: state.config.guardian.maxChecks,
+      onPhase: (phase) => updateReviewUi(ctx, state, phase),
     },
   );
 
@@ -307,6 +309,34 @@ function manualNote(classifierResult: ClassifierResult): string {
     return `Guardian review ${assessment.outcome === "allow" ? "approved" : "denied"} (risk: ${risk}, authorization: ${auth}): ${assessment.rationale}`;
   }
   return `Auto-review unavailable (${assessment.rationale}); manual review required`;
+}
+
+/**
+ * Live UI feedback while the review model is working: status bar shows the
+ * phase (reviewing / verifying), and the working area shows a spinner.
+ */
+function updateReviewUi(ctx: ExtensionContext, state: SessionState, phase: ReviewPhase): void {
+  const s = state.stats;
+  const statusKey = "perm";
+  switch (phase.kind) {
+    case "start":
+      ctx.ui.setStatus(statusKey, "🔒 reviewing…");
+      ctx.ui.setWorkingMessage("🔒 pi-menshen auto-review in progress…");
+      break;
+    case "check":
+      ctx.ui.setStatus(statusKey, `🔒 verifying: ${truncateUi(phase.command, 28)}`);
+      ctx.ui.setWorkingMessage(`🔒 pi-menshen verifying: ${phase.command}`);
+      break;
+    case "end":
+      ctx.ui.setWorkingMessage(); // restore default
+      ctx.ui.setStatus(statusKey, `🔒 ✓${s.approved} ✗${s.denied} ⚠${s.reviewed}`);
+      break;
+  }
+}
+
+/** Shorten long commands for the status bar. */
+function truncateUi(text: string, maxChars: number): string {
+  return text.length <= maxChars ? text : `${text.slice(0, maxChars)}…`;
 }
 
 interface ManualDecision {
@@ -400,12 +430,10 @@ function isPathTool(toolName: string): boolean {
 function currentTurnId(ctx: ExtensionContext): string {
   try {
     const branch = ctx.sessionManager.getBranch() as Array<{ type?: string; id?: string; message?: { role?: string } }>;
-    for (let index = branch.length - 1; index >= 0; index--) {
-      const entry = branch[index];
-      if (entry?.type === "message" && entry.message?.role === "user" && entry.id) {
-        return entry.id;
-      }
-    }
+    const index = branch.findLastIndex(
+      (entry) => entry?.type === "message" && entry.message?.role === "user" && entry.id != null,
+    );
+    if (index !== -1) return branch[index]!.id!;
   } catch {
     // fall through
   }
@@ -555,24 +583,26 @@ function rebuildRuleSet(state: SessionState): void {
 function findLatestUserRequest(ctx: ExtensionContext): string | null {
   try {
     const branch = ctx.sessionManager.getBranch();
-    for (let index = branch.length - 1; index >= 0; index--) {
-      const entry = branch[index] as { type?: string; message?: unknown } | undefined;
-      if (!entry || entry.type !== "message") continue;
-      const message = entry.message as { role?: string; content?: unknown } | undefined;
-      if (!message || message.role !== "user") continue;
-      if (typeof message.content === "string") return message.content;
-      if (!Array.isArray(message.content)) return null;
-      const text = message.content
-        .filter(
-          (part): part is { type: "text"; text: string } =>
-            typeof part === "object" && part !== null &&
-            (part as { type?: string }).type === "text" &&
-            typeof (part as { text?: unknown }).text === "string",
-        )
-        .map((part) => part.text)
-        .join("\n");
-      return text || null;
-    }
+    const index = branch.findLastIndex((raw) => {
+      const entry = raw as { type?: string; message?: unknown } | undefined;
+      const message = entry?.message as { role?: string } | undefined;
+      return entry?.type === "message" && message?.role === "user";
+    });
+    if (index === -1) return null;
+    const entry = branch[index] as unknown as { type: "message"; message: { role: string; content?: unknown } };
+    const { content } = entry.message;
+    if (typeof content === "string") return content;
+    if (!Array.isArray(content)) return null;
+    const text = content
+      .filter(
+        (part): part is { type: "text"; text: string } =>
+          typeof part === "object" && part !== null &&
+          (part as { type?: string }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string",
+      )
+      .map((part) => part.text)
+      .join("\n");
+    return text || null;
   } catch {
     // Missing context only makes the classifier more conservative, never weaker
   }

@@ -32,8 +32,6 @@ import { getPermissionDir } from "./config.ts";
 const MAX_COMMAND_LENGTH = 10_000;
 /** Node budget: exceeding it counts as a parse failure (fail-closed) */
 const MAX_NODES = 50_000;
-/** Sync parse time cap (ms) */
-const PARSE_TIMEOUT_MS = 100;
 
 const BASH_WASM_VERSION = "v0.25.1";
 const BASH_WASM_URL = `https://github.com/tree-sitter/tree-sitter-bash/releases/download/${BASH_WASM_VERSION}/tree-sitter-bash.wasm`;

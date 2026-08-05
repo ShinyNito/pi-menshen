@@ -118,8 +118,6 @@ const PACKAGE_READ_ONLY_SUBCOMMANDS = new Set([
   "ls", "list", "view", "info", "search", "outdated", "why", "doctor", "config", "root", "bin",
 ]);
 
-const PYTHON_READ_ONLY = new Set(["-c", "--version", "-V", "-m", "pytest", "--help", "-h"]);
-
 /**
  * Whether a command is read-only (auto-allowed).
  * Conservative: when unsure → false (hand to classifier / manual).

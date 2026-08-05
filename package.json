@@ -22,7 +22,7 @@
     "parser.ts",
     "classifier.ts",
     "config.ts",
-    "policy.md",
+    "policy.ts",
     "tree-sitter-bash.wasm",
     "README.md",
     "README_zh.md"

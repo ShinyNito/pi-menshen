@@ -201,11 +201,11 @@ export function loadConfig(): PermissionConfig {
     sensitivePaths: stored.sensitivePaths ?? DEFAULT_CONFIG.sensitivePaths,
     guardian: {
       ...DEFAULT_CONFIG.guardian,
-      ...(stored.guardian ?? {}),
+      ...stored.guardian,
     },
     rules: {
       ...defaultRulesSection(),
-      ...(stored.rules ?? {}),
+      ...stored.rules,
     },
   };
   return merged;
