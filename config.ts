@@ -34,6 +34,27 @@ export interface RulesSection {
   ask: string[];
 }
 
+/** Guardian auto-review settings (model-review layer) */
+export interface GuardianConfig {
+  /**
+   * Max model attempts per review for transient failures (Codex: 3).
+   * Non-transient failures fail closed immediately.
+   */
+  maxAttempts: number;
+  /** Max read-only checks the reviewer may run per review */
+  maxChecks: number;
+  /** Read-only check command timeout (ms) */
+  checkTimeoutMs: number;
+  /** Max output chars per check result */
+  checkOutputChars: number;
+  /** Consecutive denials in one turn that trip the circuit breaker */
+  consecutiveDenyLimit: number;
+  /** Denials within the recent window that trip the circuit breaker */
+  denyWindowLimit: number;
+  /** Recent-denial tracking window size */
+  denyWindowSize: number;
+}
+
 /** Runtime rule (with provenance) */
 export interface PermissionRule {
   behavior: PermissionBehavior;
@@ -66,6 +87,8 @@ export interface PermissionConfig {
   sessionCache: boolean;
   /** Sensitive-path write protection (writes to these paths go to review/manual) */
   sensitivePaths: string[];
+  /** Guardian auto-review settings */
+  guardian: GuardianConfig;
   /** Permission rules */
   rules: RulesSection;
 }
@@ -107,6 +130,15 @@ export const DEFAULT_CONFIG: PermissionConfig = {
     ".github/workflows",
     ".gitlab-ci.yml",
   ],
+  guardian: {
+    maxAttempts: 3,
+    maxChecks: 3,
+    checkTimeoutMs: 4_000,
+    checkOutputChars: 4_000,
+    consecutiveDenyLimit: 3,
+    denyWindowLimit: 10,
+    denyWindowSize: 50,
+  },
   rules: { allow: [], deny: [], ask: [] },
 };
 
@@ -167,6 +199,10 @@ export function loadConfig(): PermissionConfig {
     ...DEFAULT_CONFIG,
     ...stored,
     sensitivePaths: stored.sensitivePaths ?? DEFAULT_CONFIG.sensitivePaths,
+    guardian: {
+      ...DEFAULT_CONFIG.guardian,
+      ...(stored.guardian ?? {}),
+    },
     rules: {
       ...defaultRulesSection(),
       ...(stored.rules ?? {}),

@@ -15,6 +15,7 @@
     "parser.ts",
     "classifier.ts",
     "config.ts",
+    "policy.md",
     "tree-sitter-bash.wasm",
     "README.md",
     "README_zh.md"
@@ -29,6 +30,8 @@
     "web-tree-sitter": "^0.26.11"
   },
   "devDependencies": {
+    "@earendil-works/pi-ai": "^0.83.0",
+    "@earendil-works/pi-coding-agent": "^0.83.0",
     "@types/node": "^22.10.0",
     "typescript": "^5.7.0"
   },

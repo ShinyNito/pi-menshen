@@ -17,10 +17,15 @@ Runs permanently in **auto-review mode** (no mode switching): rule engine → de
   - Escaped operators (`cd src\&\& python3 evil.py`) are not mis-split
   - Heredoc contents do not participate in rule matching; redirections (`> out.txt`) are stripped from the matched text
   - Parse failure → fail-closed: skip the deterministic fast path, hand over to the auto-review model
-- **Auto-review mode** (core)
-  - When no rule matches, an LLM classifier reviews the "tool call + governing request" and outputs `APPROVE` / `REVIEW`
-  - Only an exact `APPROVE` auto-approves; timeout / error / malformed output always falls back to manual review (fail-safe)
-  - Deterministic high-risk signals (secrets/credentials, prompt injection, dangerous bash patterns, external-directory access) skip the LLM and go straight to REVIEW
+- **Auto-review mode** (core, Guardian-style)
+  - When no rule matches, a dedicated **reviewer model** assesses the exact planned action against the governing user request and surrounding transcript
+  - Outputs structured JSON: `{ risk_level, user_authorization, outcome: allow|deny, rationale }` (low risk may return `{"outcome":"allow"}`)
+  - The reviewer sees a **reconstructed transcript** (user intent + recent assistant/tool context, token-budgeted) as untrusted evidence
+  - The reviewer can run **read-only verification** (`ls`, `stat`, `git status`, …) against local state before deciding
+  - The reviewer conversation is **reused across reviews** (delta transcript, stable prompt-cache prefix)
+  - **Rejection circuit breaker**: too many auto-review denials in one turn (3 consecutive / 10 in the last 50) interrupts the turn; denials carry no-bypass guidance
+  - Timeout / error / malformed output always fail closed → manual review (fail-safe)
+  - Deterministic high-risk signals (secrets/credentials, prompt injection, dangerous bash patterns) skip the LLM and go straight to REVIEW
   - Inputs are sanitized before being sent to the model (private keys, Bearer tokens, `sk-*`, etc. are masked)
 - **Deterministic fast paths** (cost saving)
   - Read-only commands (`ls`, `git status`, `npm ls`, …) auto-allow
@@ -48,11 +53,20 @@ Config file: `~/.pi/pi-menshen.json` (directory overridable via `PI_MENSHEN_DIR`
   "version": 1,
   "enabled": true,
   "classifierModel": "",
-  "classifierTimeoutMs": 10000,
+  "classifierTimeoutMs": 30000,
   "maxClassifierChars": 18000,
   "gatedTools": ["bash", "write", "edit", "fetch_content", "mcp"],
   "sessionCache": true,
   "sensitivePaths": [".env", ".env.*", "*.pem", "package-lock.json", ".github/workflows"],
+  "guardian": {
+    "maxAttempts": 3,
+    "maxChecks": 3,
+    "checkTimeoutMs": 4000,
+    "checkOutputChars": 4000,
+    "consecutiveDenyLimit": 3,
+    "denyWindowLimit": 10,
+    "denyWindowSize": 50
+  },
   "rules": {
     "allow": ["Bash(npm run:*)"],
     "deny": ["Bash(rm -rf /)"],
@@ -61,7 +75,7 @@ Config file: `~/.pi/pi-menshen.json` (directory overridable via `PI_MENSHEN_DIR`
 }
 ```
 
-### Choosing a classifier model
+### Choosing a reviewer model
 
 Set `classifierModel` to `"provider/modelId"`, use `pi --list-models` to list available models:
 
@@ -105,26 +119,32 @@ tool call
   │      ├─ read-only tool / read-only command → allow
   │      └─ write/edit to non-sensitive in-project path → allow
   ├─ 4. Session cache hit → reuse decision
-  ├─ 5. Auto-review classifier (LLM)
+  ├─ 5. Guardian auto-review
   │      ├─ deterministic risk signals (secrets/dangerous commands/injection) → REVIEW (no LLM call)
-  │      ├─ APPROVE → allow (recorded in session cache)
-  │      └─ REVIEW / timeout / error → manual confirmation
+  │      ├─ reviewer rebuilds a compact transcript (delta reuse) + planned action
+  │      ├─ reviewer may run read-only checks (allowlist) to verify local state
+  │      ├─ strict JSON: {risk_level, user_authorization, outcome, rationale}
+  │      ├─ allow → approved (recorded in session cache)
+  │      └─ deny / timeout / error → manual confirmation (+ denial guidance; circuit breaker may interrupt the turn)
   └─ 6. Manual confirmation (allow / deny / deny and remember)
 ```
 
 ## Security notes
 
-- All inputs are treated as untrusted data; the system prompt explicitly forbids following instructions inside inputs (prompt-injection defense)
-- The classifier only accepts an exact `APPROVE`; everything else (REVIEW, noise, timeout, error) goes to manual review
+- All inputs are treated as untrusted data; the policy explicitly forbids following instructions inside inputs (prompt-injection defense)
+- The reviewer must return strict JSON; malformed output, timeout, and errors fail closed (deny → manual review)
+- The reviewer may only run allowlist read-only checks (`ls`, `stat`, `git status`, …) with no shell; compound commands, redirections, and shell expansion are rejected
 - In non-interactive mode (rpc/print) manual confirmation is unavailable and the default is **deny** (fail-closed)
 - deny rules strip all leading env vars (`FOO=bar rm -rf /` still matches `Bash(rm:*)`)
 - Bare shells (`bash`, `sh`, `sudo`, …) cannot generate allow prefix rules
+- Repeated auto-review denials in one turn trip the circuit breaker and interrupt the turn
 
 ## Development
 
 ```bash
-npm run typecheck   # type check (npx tsc --noEmit)
-npm test            # smoke tests (rule engine + tree-sitter integration)
+bun x tsc --noEmit   # type check (or: pnpm typecheck)
+pnpm install         # install dev dependencies (peer deps for type checking)
+node --experimental-strip-types --test tests.test.ts   # smoke tests (or: pnpm test)
 ```
 
 Requires node ≥ 22.6 (native TypeScript type stripping, used by the test runner).
@@ -132,11 +152,12 @@ Requires node ≥ 22.6 (native TypeScript type stripping, used by the test runne
 File structure:
 
 ```
-index.ts        # entry: event wiring, decision pipeline, /perm commands
+index.ts        # entry: event wiring, decision pipeline, circuit breaker, /perm commands
 rules.ts        # rule engine: parsing, exact/prefix/wildcard matching, path rules
 parser.ts       # tree-sitter bash parsing: sub-command splitting, redirection extraction
 bash.ts         # command analysis: read-only detection, wrapper/env stripping, danger patterns, sensitive paths
-classifier.ts   # auto-review: deterministic REVIEW signals + LLM APPROVE/REVIEW
+classifier.ts   # Guardian auto-review: transcript reconstruction, structured JSON, read-only checks, retry, reviewer session
+policy.md       # review policy (risk taxonomy + output contract), shipped to the reviewer as system prompt
 config.ts       # config/rule persistence (~/.pi/pi-menshen.json)
 tree-sitter-bash.wasm  # shipped grammar (downloaded from tree-sitter-bash v0.25.1)
 ```

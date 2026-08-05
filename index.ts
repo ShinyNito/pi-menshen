@@ -5,8 +5,9 @@
  *
  *   tool call → rule engine (deny/ask/allow, exact/prefix/wildcard)
  *             → deterministic fast paths (read-only commands, in-project writes)
- *             → auto-review classifier (LLM decides APPROVE / REVIEW)
- *             → manual confirmation dialog (when classifier says REVIEW)
+ *             → Guardian auto-review (structured JSON assessment, transcript
+ *               context, read-only verification, rejection circuit breaker)
+ *             → manual confirmation dialog (when the review denies)
  *
  * Rule format "Tool(content)":
  *   e.g. Bash(npm install:*)  Bash(rm -rf /)  Write(.env*)  Read(*)
@@ -23,6 +24,7 @@ import {
   loadProjectRules,
   projectRulesPath,
   saveConfig,
+  type GuardianConfig,
   type PermissionConfig,
   type RulesSection,
 } from "./config.ts";
@@ -46,7 +48,10 @@ import {
 } from "./bash.ts";
 import {
   classifyRequest,
+  createReviewerSession,
   type ClassifierResult,
+  type GuardianAssessment,
+  type ReviewerSessionState,
 } from "./classifier.ts";
 
 // ============================================================================
@@ -65,6 +70,10 @@ const BARE_SHELL_PREFIXES = new Set([
 
 const SESSION_CACHE_LIMIT = 200;
 
+/** Denial feedback appended to blocked actions (mirrors Codex GUARDIAN_REJECTION_INSTRUCTIONS). */
+const REJECTION_INSTRUCTIONS =
+  "The agent must not attempt to achieve the same outcome via workaround, indirect execution, or policy circumvention. Proceed only with a materially safer alternative, or if the user explicitly approves the action after being informed of the risk. Otherwise, stop and request user input.";
+
 // ============================================================================
 // Session state
 // ============================================================================
@@ -77,6 +86,46 @@ interface SessionState {
   cache: Map<string, { decision: "allow" | "deny"; reason?: string }>;
   stats: { approved: number; denied: number; reviewed: number; classifierUsed: number };
   userRequest: string | null;
+  /** Guardian reviewer conversation (reused across reviews for delta + prompt caching) */
+  reviewer: ReviewerSessionState;
+  /** Rejection circuit breaker: turnId → counters */
+  circuitBreaker: Map<string, { consecutive: number; recent: Array<boolean> }>;
+}
+
+// ============================================================================
+// Rejection circuit breaker (per turn; mirrors Codex GuardianRejectionCircuitBreaker)
+// ============================================================================
+
+/** Record a review outcome for the current turn; returns true when the breaker trips. */
+function recordReviewOutcome(
+  state: SessionState,
+  turnId: string,
+  denied: boolean,
+  config: GuardianConfig,
+): boolean {
+  let turn = state.circuitBreaker.get(turnId);
+  if (!turn) {
+    turn = { consecutive: 0, recent: [] };
+    state.circuitBreaker.set(turnId, turn);
+  }
+  if (denied) {
+    turn.consecutive += 1;
+  } else {
+    turn.consecutive = 0;
+  }
+  turn.recent.push(denied);
+  if (turn.recent.length > config.denyWindowSize) {
+    turn.recent.shift();
+  }
+  const recentDenials = turn.recent.filter(Boolean).length;
+  return (
+    turn.consecutive >= config.consecutiveDenyLimit ||
+    recentDenials >= config.denyWindowLimit
+  );
+}
+
+function clearTurnBreaker(state: SessionState, turnId: string): void {
+  state.circuitBreaker.delete(turnId);
 }
 
 // ============================================================================
@@ -189,9 +238,14 @@ async function decideToolCall(
     },
     state.config,
     ctx.signal,
+    {
+      session: state.reviewer,
+      maxAttempts: state.config.guardian.maxAttempts,
+      maxChecks: state.config.guardian.maxChecks,
+    },
   );
 
-  if (classifierResult.decision === "APPROVE") {
+  if (classifierResult.decision === "allow") {
     state.stats.approved++;
     state.stats.classifierUsed++;
     if (state.config.sessionCache) {
@@ -200,7 +254,7 @@ async function decideToolCall(
     return {
       action: "allow",
       channel: "auto",
-      reason: `Classifier approved (${classifierResult.model})`,
+      reason: `Guardian approved (${classifierResult.model}${classifierResult.checks.length > 0 ? `, ${classifierResult.checks.length} check(s)` : ""})`,
       classifierUsed: classifierResult.classifierUsed,
     };
   }
@@ -208,15 +262,20 @@ async function decideToolCall(
   // ---------- 7. Manual confirmation ----------
   const note = manualNote(classifierResult);
   const manual = await promptManual(ctx, toolName, args, matchKey, note);
-  return finalizeManual(ctx, state, toolName, args, manual, classifierResult.classifierUsed, note);
+  return finalizeManual(ctx, state, toolName, args, manual, classifierResult.classifierUsed, note, {
+    countBreaker: classifierResult.deterministic === false && classifierResult.decision === "deny",
+  });
 }
 
-/** Human-readable note when classifier says REVIEW */
+/** Human-readable note when the reviewer denies */
 function manualNote(classifierResult: ClassifierResult): string {
+  const { assessment } = classifierResult;
+  const risk = assessment.risk_level;
+  const auth = assessment.user_authorization;
   if (classifierResult.classifierUsed) {
-    return `Classifier recommends manual review (${classifierResult.reason})`;
+    return `Guardian review ${assessment.outcome === "allow" ? "approved" : "denied"} (risk: ${risk}, authorization: ${auth}): ${assessment.rationale}`;
   }
-  return `Auto-review unavailable (${classifierResult.reason}); manual review required`;
+  return `Auto-review unavailable (${assessment.rationale}); manual review required`;
 }
 
 interface ManualDecision {
@@ -234,6 +293,7 @@ function finalizeManual(
   manual: ManualDecision,
   classifierUsed: boolean,
   note: string,
+  options: { countBreaker?: boolean } = {},
 ): PipelineDecision {
   if (manual.action === "allow") {
     state.stats.approved++;
@@ -256,7 +316,35 @@ function finalizeManual(
   const reason = reasonParts.length > 0 ? reasonParts.join("; ") : "Denied by user";
 
   if (state.config.sessionCache) cacheDecision(state, toolName, args, "deny", reason);
-  return { action: "block", channel: "manual", reason, classifierUsed };
+
+  // Circuit breaker: count only auto-review denials (user denials are deliberate,
+  // mirroring Codex where the breaker counts Guardian denials only)
+  if (options.countBreaker) {
+    const breakerTripped = recordReviewOutcome(
+      state,
+      currentTurnId(ctx),
+      /*denied*/ true,
+      state.config.guardian,
+    );
+    if (breakerTripped) {
+      ctx.abort();
+      return {
+        action: "block",
+        channel: "manual",
+        reason: `[pi-menshen] Automatic approval review rejected too many actions for this turn (consecutive ${state.config.guardian.consecutiveDenyLimit}+ / recent ${state.config.guardian.denyWindowLimit}+ in the last ${state.config.guardian.denyWindowSize} reviews); interrupting the turn. ${reason}`,
+        classifierUsed,
+      };
+    }
+  }
+
+  // Guardian-style no-bypass guidance only for auto-review denials
+  const guidance = options.countBreaker ? ` ${REJECTION_INSTRUCTIONS}` : "";
+  return {
+    action: "block",
+    channel: "manual",
+    reason: `${reason}${guidance}`,
+    classifierUsed,
+  };
 }
 
 async function promptManual(
@@ -304,6 +392,22 @@ function isPathTool(toolName: string): boolean {
     toolName === "write" || toolName === "edit" || toolName === "read" ||
     toolName === "grep" || toolName === "find" || toolName === "ls"
   );
+}
+
+/** Stable per-turn id for the circuit breaker: the latest user message entry id in the branch. */
+function currentTurnId(ctx: ExtensionContext): string {
+  try {
+    const branch = ctx.sessionManager.getBranch() as Array<{ type?: string; id?: string; message?: { role?: string } }>;
+    for (let index = branch.length - 1; index >= 0; index--) {
+      const entry = branch[index];
+      if (entry?.type === "message" && entry.message?.role === "user" && entry.id) {
+        return entry.id;
+      }
+    }
+  } catch {
+    // fall through
+  }
+  return "turn";
 }
 
 function makeCacheKey(toolName: string, args: Record<string, unknown>): string {
@@ -488,6 +592,8 @@ export default function piPermission(pi: ExtensionAPI): void {
       cache: new Map(),
       stats: { approved: 0, denied: 0, reviewed: 0, classifierUsed: 0 },
       userRequest: findLatestUserRequest(ctx),
+      reviewer: createReviewerSession(),
+      circuitBreaker: new Map(),
     };
     rebuildRuleSet(next);
     return next;
@@ -654,6 +760,8 @@ export default function piPermission(pi: ExtensionAPI): void {
   pi.on("turn_end", (_event, ctx) => {
     const current = state;
     if (!current) return;
+    // A turn ended: reset its circuit-breaker counters
+    clearTurnBreaker(current, currentTurnId(ctx));
     const s = current.stats;
     ctx.ui.setStatus("perm", `🔒 ✓${s.approved} ✗${s.denied} ⚠${s.reviewed}`);
   });

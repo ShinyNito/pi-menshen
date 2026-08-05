@@ -17,10 +17,15 @@
   - 转义操作符(`cd src\&\& python3 evil.py`)不被误拆
   - heredoc 内容不参与规则匹配;重定向(`> out.txt`)从匹配文本剥离
   - 解析失败 → fail-closed:跳过确定性快路径,交由自动审核模型判断
-- **自动审核模式**(核心)
-  - 规则未命中时,由 LLM 分类器审查「工具调用 + 支配请求」,输出 `APPROVE` / `REVIEW`
-  - 只有精确的 `APPROVE` 才自动放行;超时/错误/格式异常一律转人工(fail-safe)
-  - 确定性高风险特征(密钥/凭证、提示注入、危险 bash 模式、外部目录访问)不调用 LLM,直接 REVIEW
+- **自动审核模式**(核心,Guardian 式)
+  - 规则未命中时,由**专用审核模型**审查「计划动作 + 支配请求 + 周边对话」
+  - 输出结构化 JSON:`{ risk_level, user_authorization, outcome: allow|deny, rationale }`(低风险可直接 `{"outcome":"allow"}`)
+  - 审核模型看到的是**重建的紧凑 transcript**(用户意图 + 最近的助手/工具上下文,带 token 预算),全部视为不可信证据
+  - 审核模型可执行**只读查证**(`ls`、`stat`、`git status`…)核实本地状态后再下结论
+  - 审核对话**跨审查复用**(delta 增量 transcript,稳定 prompt-cache 前缀)
+  - **拒绝熔断**:单轮内自动审查拒绝过多(连续 3 次 / 最近 50 次中 10 次)即中断整个 turn;拒绝附带禁止绕过指引
+  - 超时/错误/格式异常一律 fail-closed → 人工(fail-safe)
+  - 确定性高风险特征(密钥/凭证、提示注入、危险 bash 模式)不调用 LLM,直接 REVIEW
   - 输入脱敏后才发给模型(私钥、Bearer token、`sk-*` 等被遮蔽)
 - **确定性快路径**(省钱)
   - 只读命令(`ls`、`git status`、`npm ls`…)自动放行
@@ -50,10 +55,10 @@ mkdir -p .pi/extensions
 ln -s /path/to/pi-menshen .pi/extensions/pi-menshen
 ```
 
-依赖安装(首次;本地路径安装时 pi 不会自动跑 `npm install`):
+依赖安装(首次;本地路径安装时 pi 不会自动跑 `pnpm install`):
 
 ```bash
-cd /path/to/pi-menshen && npm install
+cd /path/to/pi-menshen && pnpm install
 ```
 
 然后在 pi 中 `/reload`。`tree-sitter-bash.wasm` 已随扩展分发;若缺失会自动从
@@ -68,11 +73,20 @@ GitHub release 下载到 `~/.pi/`。
   "version": 1,
   "enabled": true,
   "classifierModel": "",
-  "classifierTimeoutMs": 10000,
+  "classifierTimeoutMs": 30000,
   "maxClassifierChars": 18000,
   "gatedTools": ["bash", "write", "edit", "fetch_content", "mcp"],
   "sessionCache": true,
   "sensitivePaths": [".env", ".env.*", "*.pem", "package-lock.json", ".github/workflows"],
+  "guardian": {
+    "maxAttempts": 3,
+    "maxChecks": 3,
+    "checkTimeoutMs": 4000,
+    "checkOutputChars": 4000,
+    "consecutiveDenyLimit": 3,
+    "denyWindowLimit": 10,
+    "denyWindowSize": 50
+  },
   "rules": {
     "allow": ["Bash(npm run:*)"],
     "deny": ["Bash(rm -rf /)"],
@@ -81,7 +95,7 @@ GitHub release 下载到 `~/.pi/`。
 }
 ```
 
-### 分类器模型怎么配
+### 审核模型怎么配
 
 `classifierModel` 填 `"provider/modelId"`,用 `pi --list-models` 查看可用模型:
 
@@ -125,26 +139,32 @@ GitHub release 下载到 `~/.pi/`。
   │      ├─ 只读工具/只读命令 → 放行
   │      └─ write/edit 项目内非敏感路径 → 放行
   ├─ 4. 会话缓存命中 → 复用决策
-  ├─ 5. 自动审核分类器(LLM)
+  ├─ 5. Guardian 自动审核
   │      ├─ 确定性风险特征(密钥/危险命令/注入)→ REVIEW(不调 LLM)
-  │      ├─ APPROVE → 放行(记入会话缓存)
-  │      └─ REVIEW / 超时 / 错误 → 人工确认
+  │      ├─ 重建紧凑 transcript(delta 复用)+ 计划动作
+  │      ├─ 审核模型可跑只读查证(白名单命令)核实本地状态
+  │      ├─ 严格 JSON:{risk_level, user_authorization, outcome, rationale}
+  │      ├─ allow → 放行(记入会话缓存)
+  │      └─ deny / 超时 / 错误 → 人工确认(+ 禁止绕过指引;熔断可能中断本轮)
   └─ 6. 人工确认(允许 / 拒绝 / 拒绝并记住)
 ```
 
 ## 安全说明
 
-- 所有输入视为不可信数据;系统提示显式禁止跟随输入中的指令(防提示注入)
-- 分类器**只认精确的 `APPROVE`**;其余一切(REVIEW、噪声、超时、错误)转人工
+- 所有输入视为不可信数据;策略(policy)显式禁止跟随输入中的指令(防提示注入)
+- 审核模型必须返回严格 JSON;格式异常、超时、错误一律 fail-closed(deny → 人工)
+- 审核模型只能执行白名单只读查证(`ls`、`stat`、`git status`…),无 shell;复合命令、重定向、shell 展开一律拒绝
 - 非交互模式(rpc/print)下人工确认不可用时默认**拒绝**(fail-closed)
 - deny 规则剥离全部前导环境变量(`FOO=bar rm -rf /` 仍命中 `Bash(rm:*)`)
 - 裸 shell(`bash`、`sh`、`sudo`…)不允许生成 allow 前缀规则
+- 单轮内自动审查拒绝过多会触发熔断并中断整个 turn
 
 ## 开发
 
 ```bash
-npm run typecheck   # 类型检查(npx tsc --noEmit)
-npm test            # 冒烟测试(规则引擎 + tree-sitter 集成)
+bun x tsc --noEmit   # 类型检查
+pnpm install         # 安装依赖(dev 依赖含 pi peer 包,供类型检查)
+node --experimental-strip-types --test tests.test.ts   # 冒烟测试
 ```
 
 需要 node ≥ 22.6(测试运行器依赖原生 TypeScript 类型剥离)。
@@ -152,11 +172,12 @@ npm test            # 冒烟测试(规则引擎 + tree-sitter 集成)
 文件结构:
 
 ```
-index.ts        # 入口:事件接线、决策管线、/perm 命令
+index.ts        # 入口:事件接线、决策管线、熔断器、/perm 命令
 rules.ts        # 规则引擎:解析、精确/前缀/通配匹配、路径规则
 parser.ts       # tree-sitter bash 解析:子命令拆分、重定向提取
 bash.ts         # 命令分析:只读识别、包装器/环境变量剥离、危险模式、敏感路径
-classifier.ts   # 自动审核:确定性 REVIEW 特征 + LLM APPROVE/REVIEW
+classifier.ts   # Guardian 自动审核:transcript 重建、结构化 JSON、只读查证、重试、审核会话复用
+policy.md       # 审核策略(风险分类学 + 输出契约),作为 system prompt 发给审核模型
 config.ts       # 配置/规则持久化(~/.pi/pi-menshen.json)
 tree-sitter-bash.wasm  # 随扩展分发的语法(下载自 tree-sitter-bash v0.25.1)
 ```
