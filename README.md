@@ -24,6 +24,7 @@ Runs permanently in **auto-review mode** (no mode switching): rule engine → de
   - The reviewer can run **read-only verification** (`ls`, `stat`, `git status`, …) against local state before deciding
   - The reviewer conversation is **reused across reviews** (delta transcript, stable prompt-cache prefix)
   - **Rejection circuit breaker**: too many auto-review denials in one turn (3 consecutive / 10 in the last 50) interrupts the turn; denials carry no-bypass guidance
+  - A definitive reviewer deny is **fed back to the agent** as a tool error result (rationale + no-bypass guidance), so it can propose a safer alternative; the manual dialog is only shown when the reviewer could not decide (timeout / failure / deterministic REVIEW)
   - Timeout / error / malformed output always fail closed → manual review (fail-safe)
   - Deterministic high-risk signals (secrets/credentials, prompt injection, dangerous bash patterns) skip the LLM and go straight to REVIEW
   - Inputs are sanitized before being sent to the model (private keys, Bearer tokens, `sk-*`, etc. are masked)
@@ -120,13 +121,15 @@ tool call
   │      └─ write/edit to non-sensitive in-project path → allow
   ├─ 4. Session cache hit → reuse decision
   ├─ 5. Guardian auto-review
-  │      ├─ deterministic risk signals (secrets/dangerous commands/injection) → REVIEW (no LLM call)
+  │      ├─ deterministic risk signals (secrets/dangerous commands/injection) → manual REVIEW (no LLM call)
   │      ├─ reviewer rebuilds a compact transcript (delta reuse) + planned action
   │      ├─ reviewer may run read-only checks (allowlist) to verify local state
   │      ├─ strict JSON: {risk_level, user_authorization, outcome, rationale}
   │      ├─ allow → approved (recorded in session cache)
-  │      └─ deny / timeout / error → manual confirmation (+ denial guidance; circuit breaker may interrupt the turn)
-  └─ 6. Manual confirmation (allow / deny / deny and remember)
+  │      └─ deny → result fed back to the agent (rationale + no-bypass guidance);
+  │             circuit breaker interrupts the turn after repeated denials
+  └─ 6. Manual confirmation (only when the reviewer could not decide)
+         (allow / deny / deny and remember)
 ```
 
 ## Security notes

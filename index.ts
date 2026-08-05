@@ -259,12 +259,43 @@ async function decideToolCall(
     };
   }
 
-  // ---------- 7. Manual confirmation ----------
+  // ---------- 7. Auto-review denial: return the result to the agent (no manual dialog) ----------
+  // Mirroring Codex: a definitive Guardian deny is fed back to the agent as a tool
+  // error result (rationale + no-bypass guidance) so it can propose a safer
+  // alternative. The manual dialog is reserved for cases the reviewer could not
+  // decide (timeout / failure / deterministic REVIEW). The rejection circuit
+  // breaker still aborts the turn after repeated denials.
+  if (classifierResult.classifierUsed && classifierResult.decision === "deny") {
+    state.stats.denied++;
+    state.stats.reviewed++;
+    const { assessment } = classifierResult;
+    const reason =
+      `Guardian review denied (risk: ${assessment.risk_level}, authorization: ${assessment.user_authorization}): ${assessment.rationale}` +
+      ` ${REJECTION_INSTRUCTIONS}`;
+    if (state.config.sessionCache) cacheDecision(state, toolName, args, "deny", reason);
+
+    const breakerTripped = recordReviewOutcome(
+      state,
+      currentTurnId(ctx),
+      /*denied*/ true,
+      state.config.guardian,
+    );
+    if (breakerTripped) {
+      ctx.abort();
+      return {
+        action: "block",
+        channel: "auto",
+        reason: `Automatic approval review rejected too many actions for this turn (consecutive ${state.config.guardian.consecutiveDenyLimit}+ / recent ${state.config.guardian.denyWindowLimit}+ in the last ${state.config.guardian.denyWindowSize} reviews); interrupting the turn. ${reason}`,
+        classifierUsed: true,
+      };
+    }
+    return { action: "block", channel: "auto", reason, classifierUsed: true };
+  }
+
+  // ---------- 8. Manual confirmation (reviewer could not decide / deterministic REVIEW) ----------
   const note = manualNote(classifierResult);
   const manual = await promptManual(ctx, toolName, args, matchKey, note);
-  return finalizeManual(ctx, state, toolName, args, manual, classifierResult.classifierUsed, note, {
-    countBreaker: classifierResult.deterministic === false && classifierResult.decision === "deny",
-  });
+  return finalizeManual(ctx, state, toolName, args, manual, classifierResult.classifierUsed, note);
 }
 
 /** Human-readable note when the reviewer denies */
@@ -293,7 +324,6 @@ function finalizeManual(
   manual: ManualDecision,
   classifierUsed: boolean,
   note: string,
-  options: { countBreaker?: boolean } = {},
 ): PipelineDecision {
   if (manual.action === "allow") {
     state.stats.approved++;
@@ -316,35 +346,7 @@ function finalizeManual(
   const reason = reasonParts.length > 0 ? reasonParts.join("; ") : "Denied by user";
 
   if (state.config.sessionCache) cacheDecision(state, toolName, args, "deny", reason);
-
-  // Circuit breaker: count only auto-review denials (user denials are deliberate,
-  // mirroring Codex where the breaker counts Guardian denials only)
-  if (options.countBreaker) {
-    const breakerTripped = recordReviewOutcome(
-      state,
-      currentTurnId(ctx),
-      /*denied*/ true,
-      state.config.guardian,
-    );
-    if (breakerTripped) {
-      ctx.abort();
-      return {
-        action: "block",
-        channel: "manual",
-        reason: `[pi-menshen] Automatic approval review rejected too many actions for this turn (consecutive ${state.config.guardian.consecutiveDenyLimit}+ / recent ${state.config.guardian.denyWindowLimit}+ in the last ${state.config.guardian.denyWindowSize} reviews); interrupting the turn. ${reason}`,
-        classifierUsed,
-      };
-    }
-  }
-
-  // Guardian-style no-bypass guidance only for auto-review denials
-  const guidance = options.countBreaker ? ` ${REJECTION_INSTRUCTIONS}` : "";
-  return {
-    action: "block",
-    channel: "manual",
-    reason: `${reason}${guidance}`,
-    classifierUsed,
-  };
+  return { action: "block", channel: "manual", reason, classifierUsed };
 }
 
 async function promptManual(
