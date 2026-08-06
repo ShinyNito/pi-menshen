@@ -1,6 +1,6 @@
 {
   "name": "@shinynito/pi-menshen",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "pi extension: permission gate with auto-review mode (tree-sitter bash parsing)",
   "type": "module",
   "keywords": [
