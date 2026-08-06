@@ -98,8 +98,6 @@ export interface PermissionConfig {
    * Anything not listed passes through; defaults cover bash/write/edit and network tools.
    */
   gatedTools: string[];
-  /** Session cache: identical (tool, input) is only classified once */
-  sessionCache: boolean;
   /** Sensitive-path write protection (writes to these paths go to review/manual) */
   sensitivePaths: string[];
   /** Guardian auto-review settings */
@@ -121,7 +119,6 @@ export const DEFAULT_CONFIG: PermissionConfig = {
   classifierTimeoutMs: 10_000,
   maxClassifierChars: 18_000,
   gatedTools: ["bash", "write", "edit", "fetch_content", "mcp"],
-  sessionCache: true,
   sensitivePaths: [
     ".env",
     ".env.*",

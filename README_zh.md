@@ -31,12 +31,11 @@
 - **确定性快路径**(省钱)
   - 只读命令(`ls`、`git status`、`npm ls`…)自动放行
   - 项目内非敏感文件写入/编辑自动放行;`.env`、锁文件、CI 配置等敏感路径转审核
-  - 会话缓存:相同调用只审核一次
 - **终端通知**(OSC 9 / 777 / 99,otty 原生通知)
   - 需要人工确认、或熔断中断 turn 时,向终端发通知(otty/kitty 显示为 macOS 原生横幅)
   - 自动检测终端协议:otty/kitty → OSC 99,Ghostty/iTerm2 → OSC 9,WezTerm/urxvt → OSC 777,未知终端按 otty 推荐级联 99→777→9;tmux 内自动 DCS 透传
   - 非 TTY 环境(rpc/print)自动回落为应用内提示;`/perm notify` 可发测试通知
-- **状态显示**:footer 常驻 `🔒 ✓n ✗n ⚠n` 统计
+- **状态显示**:footer 常驻 `🔒 menshen ✓n ✗n ⚠n` 统计
 
 ## 安装
 
@@ -81,7 +80,6 @@ GitHub release 下载到 `~/.pi/`。
   "classifierTimeoutMs": 30000,
   "maxClassifierChars": 18000,
   "gatedTools": ["bash", "write", "edit", "fetch_content", "mcp"],
-  "sessionCache": true,
   "sensitivePaths": [".env", ".env.*", "*.pem", "package-lock.json", ".github/workflows"],
   "guardian": {
     "maxAttempts": 3,
@@ -135,10 +133,11 @@ GitHub release 下载到 `~/.pi/`。
 | `/perm notify [on\|off\|message]` | 开关终端通知,或发送一条测试通知(可带自定义消息) |
 | `/perm pause` / `/perm resume` | 暂停/恢复拦截 |
 
-人工确认对话框选项:
-- **允许本次** — 仅放行这一次
-- **拒绝** — 拦截
-- **拒绝并记住** — 拦截并自动生成 deny 规则(`rm -rf /` → `Bash(rm -rf /)`)
+人工确认对话框为信息面板:工具名、框起来的具体输入、Guardian 风险/授权徽标与理由(有审核结果时),然后是选项:
+- **✓ Allow once** — 仅放行这一次
+- **✗ Deny** — 拦截
+- **✗ Deny & remember** — 拦截并自动生成 deny 规则(`rm -rf /` → `Bash(rm -rf /)`)
+- **✗ Deny with reason** — 拦截并附带给 agent 的理由
 
 ## 决策流程
 
@@ -150,15 +149,14 @@ GitHub release 下载到 `~/.pi/`。
   ├─ 3. 确定性快路径
   │      ├─ 只读工具/只读命令 → 放行
   │      └─ write/edit 项目内非敏感路径 → 放行
-  ├─ 4. 会话缓存命中 → 复用决策
-  ├─ 5. Guardian 自动审核
+  ├─ 4. Guardian 自动审核
   │      ├─ 确定性风险特征(密钥/危险命令/注入)→ REVIEW(不调 LLM)
   │      ├─ 重建紧凑 transcript(delta 复用)+ 计划动作
   │      ├─ 审核模型可跑只读查证(白名单命令)核实本地状态
   │      ├─ 严格 JSON:{risk_level, user_authorization, outcome, rationale}
-  │      ├─ allow → 放行(记入会话缓存)
+  │      ├─ allow → 放行
   │      └─ deny → 结果回传给 agent(理由 + 禁止绕过指引);熔断在连续拒绝后中断本轮
-  └─ 6. 人工确认(仅当审查模型无法决定时)
+  └─ 5. 人工确认(仅当审查模型无法决定时)
          (允许 / 拒绝 / 拒绝并记住)
 ```
 

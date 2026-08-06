@@ -18,6 +18,9 @@ importers:
       '@earendil-works/pi-coding-agent':
         specifier: ^0.83.0
         version: 0.83.0(ws@8.21.2)(zod@4.4.3)
+      '@earendil-works/pi-tui':
+        specifier: ^0.83.0
+        version: 0.83.0
       '@types/node':
         specifier: ^22.10.0
         version: 22.20.1

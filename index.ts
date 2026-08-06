@@ -16,7 +16,6 @@
  * Config lives at ~/.pi/pi-menshen.json (override dir via PI_MENSHEN_DIR).
  */
 
-import { createHash } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext, ToolCallEvent } from "@earendil-works/pi-coding-agent";
 import {
   getConfigFile,
@@ -58,6 +57,13 @@ import {
   detectNotifyProtocol,
   sendTerminalNotification,
 } from "./notify.ts";
+import {
+  showInfoPanel,
+  showPermissionDialog,
+  statusReviewing,
+  statusSummary,
+  statusVerifying,
+} from "./ui.ts";
 
 // ============================================================================
 // Constants
@@ -73,8 +79,6 @@ const BARE_SHELL_PREFIXES = new Set([
   "timeout", "time", "sudo", "doas", "pkexec",
 ]);
 
-const SESSION_CACHE_LIMIT = 200;
-
 /** Denial feedback appended to blocked actions (mirrors Codex GUARDIAN_REJECTION_INSTRUCTIONS). */
 const REJECTION_INSTRUCTIONS =
   "The agent must not attempt to achieve the same outcome via workaround, indirect execution, or policy circumvention. Proceed only with a materially safer alternative, or if the user explicitly approves the action after being informed of the risk. Otherwise, stop and request user input.";
@@ -87,8 +91,6 @@ interface SessionState {
   config: PermissionConfig;
   projectRules: RulesSection;
   ruleSet: RuleSet;
-  /** Session cache: cacheKey → { decision, reason } */
-  cache: Map<string, { decision: "allow" | "deny"; reason?: string }>;
   stats: { approved: number; denied: number; reviewed: number; classifierUsed: number };
   userRequest: string | null;
   /** Guardian reviewer conversation (reused across reviews for delta + prompt caching) */
@@ -177,7 +179,7 @@ async function decideToolCall(
     case "ask": {
       const note = `Rule requires manual confirmation: ${ruleResult.rule}`;
       notifyAttention(ctx, state, "manual", `${toolName}(${truncateUi(matchKey, 60)})`);
-      const manual = await promptManual(ctx, toolName, args, matchKey, note);
+      const manual = await promptManual(ctx, toolName, args, matchKey, { note });
       return finalizeManual(ctx, state, toolName, args, manual, false, note);
     }
     case "allow":
@@ -213,24 +215,7 @@ async function decideToolCall(
     }
   }
 
-  // ---------- 5. Session cache ----------
-  if (state.config.sessionCache) {
-    const cacheKey = makeCacheKey(toolName, args);
-    const cached = state.cache.get(cacheKey);
-    if (cached?.decision === "allow") {
-      return { action: "allow", channel: "auto", reason: "Session cache (previously allowed)", classifierUsed: false };
-    }
-    if (cached?.decision === "deny") {
-      return {
-        action: "block",
-        channel: "manual",
-        reason: `Session cache (previously denied${cached.reason ? `: ${cached.reason}` : ""})`,
-        classifierUsed: false,
-      };
-    }
-  }
-
-  // ---------- 6. Auto-review classifier ----------
+  // ---------- 3. Auto-review classifier ----------
   const classifierResult = await classifyRequest(
     ctx,
     {
@@ -255,9 +240,6 @@ async function decideToolCall(
   if (classifierResult.decision === "allow") {
     state.stats.approved++;
     state.stats.classifierUsed++;
-    if (state.config.sessionCache) {
-      cacheDecision(state, toolName, args, "allow");
-    }
     return {
       action: "allow",
       channel: "auto",
@@ -266,7 +248,7 @@ async function decideToolCall(
     };
   }
 
-  // ---------- 7. Auto-review denial: return the result to the agent (no manual dialog) ----------
+  // ---------- 4. Auto-review denial: return the result to the agent (no manual dialog) ----------
   // Mirroring Codex: a definitive Guardian deny is fed back to the agent as a tool
   // error result (rationale + no-bypass guidance) so it can propose a safer
   // alternative. The manual dialog is reserved for cases the reviewer could not
@@ -279,7 +261,6 @@ async function decideToolCall(
     const reason =
       `Guardian review denied (risk: ${assessment.risk_level}, authorization: ${assessment.user_authorization}): ${assessment.rationale}` +
       ` ${REJECTION_INSTRUCTIONS}`;
-    if (state.config.sessionCache) cacheDecision(state, toolName, args, "deny", reason);
 
     const breakerTripped = recordReviewOutcome(
       state,
@@ -300,10 +281,13 @@ async function decideToolCall(
     return { action: "block", channel: "auto", reason, classifierUsed: true };
   }
 
-  // ---------- 8. Manual confirmation (reviewer could not decide / deterministic REVIEW) ----------
+  // ---------- 5. Manual confirmation (reviewer could not decide / deterministic REVIEW) ----------
   const note = manualNote(classifierResult);
   notifyAttention(ctx, state, "manual", `${toolName}(${truncateUi(matchKey, 60)})`);
-  const manual = await promptManual(ctx, toolName, args, matchKey, note);
+  const manual = await promptManual(ctx, toolName, args, matchKey, {
+    note,
+    assessment: classifierResult.classifierUsed ? classifierResult.assessment : undefined,
+  });
   return finalizeManual(ctx, state, toolName, args, manual, classifierResult.classifierUsed, note);
 }
 
@@ -324,19 +308,18 @@ function manualNote(classifierResult: ClassifierResult): string {
  */
 function updateReviewUi(ctx: ExtensionContext, state: SessionState, phase: ReviewPhase): void {
   const s = state.stats;
-  const statusKey = "perm";
   switch (phase.kind) {
     case "start":
-      ctx.ui.setStatus(statusKey, "🔒 reviewing…");
-      ctx.ui.setWorkingMessage("🔒 pi-menshen auto-review in progress…");
+      ctx.ui.setStatus("perm", statusReviewing(ctx.ui.theme));
+      ctx.ui.setWorkingMessage("🔒 menshen auto-review in progress…");
       break;
     case "check":
-      ctx.ui.setStatus(statusKey, `🔒 verifying: ${truncateUi(phase.command, 28)}`);
-      ctx.ui.setWorkingMessage(`🔒 pi-menshen verifying: ${phase.command}`);
+      ctx.ui.setStatus("perm", statusVerifying(ctx.ui.theme, phase.command));
+      ctx.ui.setWorkingMessage(`🔒 menshen verifying: ${phase.command}`);
       break;
     case "end":
       ctx.ui.setWorkingMessage(); // restore default
-      ctx.ui.setStatus(statusKey, `🔒 ✓${s.approved} ✗${s.denied} ⚠${s.reviewed}`);
+      ctx.ui.setStatus("perm", statusSummary(ctx.ui.theme, s, state.config.enabled));
       break;
   }
 }
@@ -380,7 +363,7 @@ interface ManualDecision {
   userReason?: string;
 }
 
-/** Finalize a manual decision: update stats/cache/rules and compose the full denial reason */
+/** Finalize a manual decision: update stats/rules and compose the full denial reason */
 function finalizeManual(
   ctx: ExtensionContext,
   state: SessionState,
@@ -392,7 +375,6 @@ function finalizeManual(
 ): PipelineDecision {
   if (manual.action === "allow") {
     state.stats.approved++;
-    if (state.config.sessionCache) cacheDecision(state, toolName, args, "allow");
     return { action: "allow", channel: "manual", reason: "Approved by user", classifierUsed };
   }
 
@@ -409,8 +391,6 @@ function finalizeManual(
     reasonParts.push(`Added deny rule: ${rule}`);
   }
   const reason = reasonParts.length > 0 ? reasonParts.join("; ") : "Denied by user";
-
-  if (state.config.sessionCache) cacheDecision(state, toolName, args, "deny", reason);
   return { action: "block", channel: "manual", reason, classifierUsed };
 }
 
@@ -419,29 +399,30 @@ async function promptManual(
   toolName: string,
   args: Record<string, unknown>,
   matchKey: string,
-  note: string,
+  info: { note: string; assessment?: GuardianAssessment },
 ): Promise<ManualDecision> {
   if (!ctx.hasUI) {
     return { action: "deny" }; // Non-interactive mode fail-safe: deny
   }
   const preview = summarizeInput(matchKey, args);
-  const choice = await ctx.ui.select(
-    `🔒 Permission required — ${toolName}\n\n${preview}\n\n⚠️ ${note}\n\nChoose:`,
-    ["Allow once", "Deny", "Deny & remember", "Deny with reason"],
-  );
+  const choice = await showPermissionDialog(ctx, {
+    toolName,
+    preview,
+    risk: info.assessment?.risk_level,
+    authorization: info.assessment?.user_authorization,
+    rationale: info.assessment?.rationale,
+    note: info.note,
+  });
 
   switch (choice) {
-    case "Allow once":
+    case "allow":
       return { action: "allow" };
-    case "Deny":
-      // Deny immediately, no reason dialog
-      return { action: "deny" };
-    case "Deny & remember":
+    case "deny-remember":
       // Deny and create a deny rule, no reason dialog
       return { action: "deny-remember" };
-    case "Deny with reason": {
+    case "deny-reason": {
       // Only this option opens the reason input (Enter to skip)
-      const reason = await ctx.ui.input("Reason for denial:", "");
+      const reason = await ctx.ui.input("Reason for denial (Enter to skip):", "");
       return {
         action: "deny",
         userReason:
@@ -449,7 +430,7 @@ async function promptManual(
       };
     }
     default:
-      // Esc / cancel → treat as deny
+      // "deny" or null (esc / cancel) → treat as deny
       return { action: "deny" };
   }
 }
@@ -473,33 +454,6 @@ function currentTurnId(ctx: ExtensionContext): string {
     // fall through
   }
   return "turn";
-}
-
-function makeCacheKey(toolName: string, args: Record<string, unknown>): string {
-  let serialized: string;
-  try {
-    serialized = JSON.stringify(args);
-  } catch {
-    serialized = String(args);
-  }
-  return createHash("sha256")
-    .update(`${toolName}\x00${serialized}`)
-    .digest("hex")
-    .slice(0, 24);
-}
-
-function cacheDecision(
-  state: SessionState,
-  toolName: string,
-  args: Record<string, unknown>,
-  decision: "allow" | "deny",
-  reason?: string,
-): void {
-  if (state.cache.size >= SESSION_CACHE_LIMIT) {
-    const oldest = state.cache.keys().next().value;
-    if (oldest !== undefined) state.cache.delete(oldest);
-  }
-  state.cache.set(makeCacheKey(toolName, args), { decision, reason });
 }
 
 /** Preview cap for the approval dialog: keep long content from overflowing a non-scrollable dialog */
@@ -656,7 +610,6 @@ export default function piPermission(pi: ExtensionAPI): void {
       config: loadConfig(),
       projectRules: loadProjectRules(ctx.cwd),
       ruleSet: { allow: [], deny: [], ask: [] },
-      cache: new Map(),
       stats: { approved: 0, denied: 0, reviewed: 0, classifierUsed: 0 },
       userRequest: findLatestUserRequest(ctx),
       reviewer: createReviewerSession(),
@@ -668,7 +621,7 @@ export default function piPermission(pi: ExtensionAPI): void {
 
   pi.on("session_start", (_event, ctx) => {
     state = refreshState(ctx);
-    ctx.ui.setStatus("perm", state.config.enabled ? "🔒 auto-review enabled" : "🔒 paused");
+    ctx.ui.setStatus("perm", statusSummary(ctx.ui.theme, state.stats, state.config.enabled));
   });
 
   pi.on("session_shutdown", () => {
@@ -688,7 +641,7 @@ export default function piPermission(pi: ExtensionAPI): void {
 
     // Status display
     const s = current.stats;
-    ctx.ui.setStatus("perm", `🔒 ✓${s.approved} ✗${s.denied} ⚠${s.reviewed}`);
+    ctx.ui.setStatus("perm", statusSummary(ctx.ui.theme, s, current.config.enabled));
 
     if (decision.action === "block") {
       return { block: true, reason: `[pi-menshen] ${decision.reason}` };
@@ -714,15 +667,22 @@ export default function piPermission(pi: ExtensionAPI): void {
 
       switch (sub) {
         case "rules": {
-          const lines: string[] = ["🔒 pi-menshen rules"];
-          for (const behavior of ["allow", "deny", "ask"] as const) {
-            const rules = current.ruleSet[behavior];
-            lines.push(`${behavior}(${rules.length}):`);
-            for (const rule of rules) {
-              lines.push(`  ${rule.rule} [${rule.source}]`);
+          await showInfoPanel(ctx, "🔒 menshen — rules", (theme) => {
+            const lines: string[] = [];
+            for (const behavior of ["allow", "deny", "ask"] as const) {
+              const rules = current.ruleSet[behavior];
+              const color = behavior === "allow" ? "success" : behavior === "deny" ? "error" : "warning";
+              if (lines.length > 0) lines.push("");
+              lines.push(`${theme.fg(color, theme.bold(behavior.toUpperCase()))} ${theme.fg("dim", `(${rules.length})`)}`);
+              if (rules.length === 0) {
+                lines.push(theme.fg("dim", "  (none)"));
+              }
+              for (const rule of rules) {
+                lines.push(`  ${rule.rule}  ${theme.fg("dim", `[${rule.source}]`)}`);
+              }
             }
-          }
-          ctx.ui.notify(lines.join("\n"), "info");
+            return lines;
+          });
           return;
         }
 
@@ -820,7 +780,7 @@ export default function piPermission(pi: ExtensionAPI): void {
         case "pause": {
           current.config = { ...current.config, enabled: false };
           saveConfig(current.config);
-          ctx.ui.setStatus("perm", "🔒 paused");
+          ctx.ui.setStatus("perm", statusSummary(ctx.ui.theme, current.stats, false));
           ctx.ui.notify("pi-menshen paused (tool calls no longer intercepted)", "info");
           return;
         }
@@ -828,7 +788,7 @@ export default function piPermission(pi: ExtensionAPI): void {
         case "resume": {
           current.config = { ...current.config, enabled: true };
           saveConfig(current.config);
-          ctx.ui.setStatus("perm", "🔒 auto-review enabled");
+          ctx.ui.setStatus("perm", statusSummary(ctx.ui.theme, current.stats, true));
           ctx.ui.notify("pi-menshen resumed", "info");
           return;
         }
@@ -840,19 +800,33 @@ export default function piPermission(pi: ExtensionAPI): void {
           const notifyProtocol = config.notifications.protocol === "auto"
             ? detectNotifyProtocol()
             : config.notifications.protocol;
-          const lines = [
-            "🔒 pi-menshen auto-review",
-            `  Status: ${config.enabled ? "enabled" : "paused"}`,
-            `  Classifier model: ${modelInfo}`,
-            `  Notifications: ${config.notifications.enabled ? `on (${config.notifications.protocol} → ${notifyProtocol ?? "unsupported"}; manual ${config.notifications.onManualPrompt ? "✓" : "✗"}, breaker ${config.notifications.onBreakerTrip ? "✓" : "✗"})` : "off"}`,
-            `  Rules: allow ${current.ruleSet.allow.length} / deny ${current.ruleSet.deny.length} / ask ${current.ruleSet.ask.length}`,
-            `  Session stats: ✓${s.approved} ✗${s.denied} ⚠${s.reviewed} (classifier ${s.classifierUsed} calls)`,
-            `  Config file: ${getConfigFile()}`,
-            `  Project rules: ${projectRulesPath(ctx.cwd)}`,
-            "",
-            "Commands: /perm rules | /perm allow|deny|ask <Rule> | /perm remove <Rule> | /perm notify [on|off|<message>] | /perm model [provider/modelId] | /perm pause|resume",
-          ];
-          ctx.ui.notify(lines.join("\n"), "info");
+          await showInfoPanel(ctx, "🔒 menshen — auto-review", (theme) => {
+            const label = (text: string) => theme.fg("dim", text.padEnd(12));
+            const n = config.notifications;
+            const notifyText = n.enabled
+              ? `${theme.fg("success", "on")} ${theme.fg("dim", `(${n.protocol} → ${notifyProtocol ?? "unsupported"}; manual ${n.onManualPrompt ? "✓" : "✗"}, breaker ${n.onBreakerTrip ? "✓" : "✗"})`)}`
+              : theme.fg("dim", "off");
+            const cmd = (name: string, desc: string) =>
+              `  ${theme.fg("accent", name.padEnd(34))}${theme.fg("dim", desc)}`;
+            return [
+              `${label("Status")}${config.enabled ? theme.fg("success", "● enabled") : theme.fg("warning", "○ paused")}`,
+              `${label("Model")}${modelInfo}`,
+              `${label("Notify")}${notifyText}`,
+              `${label("Rules")}${theme.fg("success", `${current.ruleSet.allow.length} allow`)} ${theme.fg("dim", "·")} ${theme.fg("error", `${current.ruleSet.deny.length} deny`)} ${theme.fg("dim", "·")} ${theme.fg("warning", `${current.ruleSet.ask.length} ask`)}`,
+              `${label("Session")}${theme.fg("success", `✓${s.approved}`)}  ${theme.fg("error", `✗${s.denied}`)}  ${theme.fg("warning", `⚠${s.reviewed}`)}  ${theme.fg("dim", `· classifier ${s.classifierUsed} calls`)}`,
+              "",
+              `${label("Config")}${getConfigFile()}`,
+              `${label("Project")}${projectRulesPath(ctx.cwd)}`,
+              "",
+              theme.fg("dim", theme.bold("Commands")),
+              cmd("/perm rules", "list all rules"),
+              cmd("/perm allow|deny|ask <Rule>", "add a rule"),
+              cmd("/perm remove <Rule>", "remove a rule"),
+              cmd("/perm notify [on|off|<msg>]", "toggle or test notifications"),
+              cmd("/perm model [provider/id]", "set classifier model"),
+              cmd("/perm pause | resume", "pause or resume the gate"),
+            ];
+          });
           return;
         }
       }
@@ -866,6 +840,6 @@ export default function piPermission(pi: ExtensionAPI): void {
     // A turn ended: reset its circuit-breaker counters
     clearTurnBreaker(current, currentTurnId(ctx));
     const s = current.stats;
-    ctx.ui.setStatus("perm", `🔒 ✓${s.approved} ✗${s.denied} ⚠${s.reviewed}`);
+    ctx.ui.setStatus("perm", statusSummary(ctx.ui.theme, s, current.config.enabled));
   });
 }

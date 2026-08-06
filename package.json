@@ -22,6 +22,7 @@
     "parser.ts",
     "classifier.ts",
     "notify.ts",
+    "ui.ts",
     "config.ts",
     "policy.ts",
     "tree-sitter-bash.wasm",
@@ -40,12 +41,14 @@
   "devDependencies": {
     "@earendil-works/pi-ai": "^0.83.0",
     "@earendil-works/pi-coding-agent": "^0.83.0",
+    "@earendil-works/pi-tui": "^0.83.0",
     "@types/node": "^22.10.0",
     "typescript": "^5.7.0"
   },
   "peerDependencies": {
     "@earendil-works/pi-ai": "*",
-    "@earendil-works/pi-coding-agent": "*"
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
   },
   "scripts": {
     "test": "node --experimental-strip-types --test tests.test.ts",

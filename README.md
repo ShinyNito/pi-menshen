@@ -31,12 +31,11 @@ Runs permanently in **auto-review mode** (no mode switching): rule engine → de
 - **Deterministic fast paths** (cost saving)
   - Read-only commands (`ls`, `git status`, `npm ls`, …) auto-allow
   - In-project non-sensitive file writes/edits auto-allow; sensitive paths (`.env`, lockfiles, CI configs) go to review
-  - Session cache: identical calls are reviewed only once
 - **Terminal notifications** (OSC 9 / 777 / 99, native in otty)
   - Notifies you when the gate needs human attention: manual confirmation required, or the circuit breaker interrupts a turn
   - Protocol auto-detected: otty/kitty → OSC 99, Ghostty/iTerm2 → OSC 9, WezTerm/urxvt → OSC 777, unknown terminals get the otty-recommended 99→777→9 cascade; tmux gets DCS passthrough automatically
   - Non-TTY environments (rpc/print) fall back to in-app toasts; `/perm notify` sends a test notification
-- **Status display**: persistent footer `🔒 ✓n ✗n ⚠n` stats
+- **Status display**: persistent footer `🔒 menshen ✓n ✗n ⚠n` stats
 
 ## Install
 
@@ -61,7 +60,6 @@ Config file: `~/.pi/pi-menshen.json` (directory overridable via `PI_MENSHEN_DIR`
   "classifierTimeoutMs": 30000,
   "maxClassifierChars": 18000,
   "gatedTools": ["bash", "write", "edit", "fetch_content", "mcp"],
-  "sessionCache": true,
   "sensitivePaths": [".env", ".env.*", "*.pem", "package-lock.json", ".github/workflows"],
   "guardian": {
     "maxAttempts": 3,
@@ -124,10 +122,11 @@ When the gate needs human attention (manual confirmation required, or the circui
 | `/perm notify [on\|off\|message]` | Toggle terminal notifications, or send a test notification (with optional custom message) |
 | `/perm pause` / `/perm resume` | Pause/resume interception |
 
-Manual confirmation dialog options:
-- **Allow once** — allow this single call
-- **Deny** — block
-- **Deny and remember** — block and auto-generate a deny rule (`rm -rf /` → `Bash(rm -rf /)`)
+The manual confirmation dialog is a bordered panel: tool name, the exact input in a framed box, Guardian risk/authorization badges with rationale (when a review produced one), then the options:
+- **✓ Allow once** — allow this single call
+- **✗ Deny** — block
+- **✗ Deny & remember** — block and auto-generate a deny rule (`rm -rf /` → `Bash(rm -rf /)`)
+- **✗ Deny with reason** — block and attach an explanation for the agent
 
 ## Decision flow
 
@@ -139,16 +138,15 @@ tool call
   ├─ 3. Deterministic fast paths
   │      ├─ read-only tool / read-only command → allow
   │      └─ write/edit to non-sensitive in-project path → allow
-  ├─ 4. Session cache hit → reuse decision
-  ├─ 5. Guardian auto-review
+  ├─ 4. Guardian auto-review
   │      ├─ deterministic risk signals (secrets/dangerous commands/injection) → manual REVIEW (no LLM call)
   │      ├─ reviewer rebuilds a compact transcript (delta reuse) + planned action
   │      ├─ reviewer may run read-only checks (allowlist) to verify local state
   │      ├─ strict JSON: {risk_level, user_authorization, outcome, rationale}
-  │      ├─ allow → approved (recorded in session cache)
+  │      ├─ allow → approved
   │      └─ deny → result fed back to the agent (rationale + no-bypass guidance);
   │             circuit breaker interrupts the turn after repeated denials
-  └─ 6. Manual confirmation (only when the reviewer could not decide)
+  └─ 5. Manual confirmation (only when the reviewer could not decide)
          (allow / deny / deny and remember)
 ```
 
