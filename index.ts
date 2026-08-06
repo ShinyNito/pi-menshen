@@ -54,6 +54,10 @@ import {
   type ReviewPhase,
   type ReviewerSessionState,
 } from "./classifier.ts";
+import {
+  detectNotifyProtocol,
+  sendTerminalNotification,
+} from "./notify.ts";
 
 // ============================================================================
 // Constants
@@ -172,6 +176,7 @@ async function decideToolCall(
       return { action: "block", channel: "rule", reason: `Rule deny: ${ruleResult.rule}`, classifierUsed: false };
     case "ask": {
       const note = `Rule requires manual confirmation: ${ruleResult.rule}`;
+      notifyAttention(ctx, state, "manual", `${toolName}(${truncateUi(matchKey, 60)})`);
       const manual = await promptManual(ctx, toolName, args, matchKey, note);
       return finalizeManual(ctx, state, toolName, args, manual, false, note);
     }
@@ -283,6 +288,7 @@ async function decideToolCall(
       state.config.guardian,
     );
     if (breakerTripped) {
+      notifyAttention(ctx, state, "breaker", "Too many auto-review denials — turn interrupted. Adjust rules or /perm pause");
       ctx.abort();
       return {
         action: "block",
@@ -296,6 +302,7 @@ async function decideToolCall(
 
   // ---------- 8. Manual confirmation (reviewer could not decide / deterministic REVIEW) ----------
   const note = manualNote(classifierResult);
+  notifyAttention(ctx, state, "manual", `${toolName}(${truncateUi(matchKey, 60)})`);
   const manual = await promptManual(ctx, toolName, args, matchKey, note);
   return finalizeManual(ctx, state, toolName, args, manual, classifierResult.classifierUsed, note);
 }
@@ -331,6 +338,34 @@ function updateReviewUi(ctx: ExtensionContext, state: SessionState, phase: Revie
       ctx.ui.setWorkingMessage(); // restore default
       ctx.ui.setStatus(statusKey, `🔒 ✓${s.approved} ✗${s.denied} ⚠${s.reviewed}`);
       break;
+  }
+}
+
+/**
+ * Send a terminal notification when the gate needs human attention.
+ * Respects config; falls back to an in-app toast when OSC is unavailable.
+ */
+function notifyAttention(
+  ctx: ExtensionContext,
+  state: SessionState,
+  kind: "manual" | "breaker",
+  body: string,
+): void {
+  const n = state.config.notifications;
+  if (!n.enabled) return;
+  const wanted = kind === "manual" ? n.onManualPrompt : n.onBreakerTrip;
+  if (!wanted) return;
+
+  const title = kind === "manual" ? "🔒 pi-menshen · Manual confirmation required" : "🔒 pi-menshen · Circuit breaker tripped";
+  const protocol = sendTerminalNotification({
+    title,
+    body,
+    id: kind === "manual" ? "menshen:manual" : "menshen:breaker",
+    protocol: n.protocol,
+  });
+  if (!protocol && ctx.hasUI) {
+    // No OSC channel (rpc/print mode or unsupported terminal): surface in-app.
+    ctx.ui.notify(`${title} ${body}`, "warning");
   }
 }
 
@@ -715,6 +750,38 @@ export default function piPermission(pi: ExtensionAPI): void {
           return;
         }
 
+        case "notify": {
+          const arg = parts.slice(1).join(" ").trim();
+          // Toggle the master switch: /perm notify on|off
+          if (arg === "on" || arg === "off") {
+            current.config = {
+              ...current.config,
+              notifications: { ...current.config.notifications, enabled: arg === "on" },
+            };
+            saveConfig(current.config);
+            ctx.ui.notify(`Terminal notifications ${arg === "on" ? "enabled" : "disabled"}`, "info");
+            return;
+          }
+          // Otherwise send a test notification (with optional custom message)
+          const message = arg || "🔒 pi-menshen test notification";
+          const protocol = sendTerminalNotification({
+            title: "🔒 pi-menshen",
+            body: message,
+            id: "menshen:test",
+            protocol: current.config.notifications.protocol,
+          });
+          if (protocol) {
+            ctx.ui.notify(`Terminal notification sent (${protocol})`, "info");
+          } else {
+            const detected = detectNotifyProtocol();
+            ctx.ui.notify(
+              `Cannot send terminal notification (unsupported terminal or non-TTY; detected: ${detected ?? "unsupported"})`,
+              "warning",
+            );
+          }
+          return;
+        }
+
         case "model": {
           const modelArg = parts[1];
           // No argument: show the current model
@@ -770,16 +837,20 @@ export default function piPermission(pi: ExtensionAPI): void {
           const s = current.stats;
           const config = current.config;
           const modelInfo = config.classifierModel || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : "current model");
+          const notifyProtocol = config.notifications.protocol === "auto"
+            ? detectNotifyProtocol()
+            : config.notifications.protocol;
           const lines = [
             "🔒 pi-menshen auto-review",
             `  Status: ${config.enabled ? "enabled" : "paused"}`,
             `  Classifier model: ${modelInfo}`,
+            `  Notifications: ${config.notifications.enabled ? `on (${config.notifications.protocol} → ${notifyProtocol ?? "unsupported"}; manual ${config.notifications.onManualPrompt ? "✓" : "✗"}, breaker ${config.notifications.onBreakerTrip ? "✓" : "✗"})` : "off"}`,
             `  Rules: allow ${current.ruleSet.allow.length} / deny ${current.ruleSet.deny.length} / ask ${current.ruleSet.ask.length}`,
             `  Session stats: ✓${s.approved} ✗${s.denied} ⚠${s.reviewed} (classifier ${s.classifierUsed} calls)`,
             `  Config file: ${getConfigFile()}`,
             `  Project rules: ${projectRulesPath(ctx.cwd)}`,
             "",
-            "Commands: /perm rules | /perm allow|deny|ask <Rule> | /perm remove <Rule> | /perm model [provider/modelId] | /perm pause|resume",
+            "Commands: /perm rules | /perm allow|deny|ask <Rule> | /perm remove <Rule> | /perm notify [on|off|<message>] | /perm model [provider/modelId] | /perm pause|resume",
           ];
           ctx.ui.notify(lines.join("\n"), "info");
           return;

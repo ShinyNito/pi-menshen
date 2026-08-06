@@ -34,6 +34,21 @@ export interface RulesSection {
   ask: string[];
 }
 
+/** Terminal notification settings (OSC 9 / 777 / 99, auto-detected) */
+export interface NotificationConfig {
+  /** Master switch for terminal notifications */
+  enabled: boolean;
+  /** Notify when a manual confirmation dialog is about to be shown */
+  onManualPrompt: boolean;
+  /** Notify when the rejection circuit breaker interrupts the turn */
+  onBreakerTrip: boolean;
+  /**
+   * OSC protocol strategy: "auto" detects from TERM_PROGRAM etc.
+   * (otty/kitty → 99, ghostty/iTerm → 9, wezterm/urxvt → 777, unknown → cascade).
+   */
+  protocol: "auto" | "osc99" | "osc9" | "osc777" | "cascade";
+}
+
 /** Guardian auto-review settings (model-review layer) */
 export interface GuardianConfig {
   /**
@@ -89,6 +104,8 @@ export interface PermissionConfig {
   sensitivePaths: string[];
   /** Guardian auto-review settings */
   guardian: GuardianConfig;
+  /** Terminal notifications (OSC) settings */
+  notifications: NotificationConfig;
   /** Permission rules */
   rules: RulesSection;
 }
@@ -138,6 +155,12 @@ export const DEFAULT_CONFIG: PermissionConfig = {
     consecutiveDenyLimit: 3,
     denyWindowLimit: 10,
     denyWindowSize: 50,
+  },
+  notifications: {
+    enabled: true,
+    onManualPrompt: true,
+    onBreakerTrip: true,
+    protocol: "auto",
   },
   rules: { allow: [], deny: [], ask: [] },
 };
@@ -202,6 +225,10 @@ export function loadConfig(): PermissionConfig {
     guardian: {
       ...DEFAULT_CONFIG.guardian,
       ...stored.guardian,
+    },
+    notifications: {
+      ...DEFAULT_CONFIG.notifications,
+      ...stored.notifications,
     },
     rules: {
       ...defaultRulesSection(),

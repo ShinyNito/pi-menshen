@@ -32,6 +32,10 @@
   - 只读命令(`ls`、`git status`、`npm ls`…)自动放行
   - 项目内非敏感文件写入/编辑自动放行;`.env`、锁文件、CI 配置等敏感路径转审核
   - 会话缓存:相同调用只审核一次
+- **终端通知**(OSC 9 / 777 / 99,otty 原生通知)
+  - 需要人工确认、或熔断中断 turn 时,向终端发通知(otty/kitty 显示为 macOS 原生横幅)
+  - 自动检测终端协议:otty/kitty → OSC 99,Ghostty/iTerm2 → OSC 9,WezTerm/urxvt → OSC 777,未知终端按 otty 推荐级联 99→777→9;tmux 内自动 DCS 透传
+  - 非 TTY 环境(rpc/print)自动回落为应用内提示;`/perm notify` 可发测试通知
 - **状态显示**:footer 常驻 `🔒 ✓n ✗n ⚠n` 统计
 
 ## 安装
@@ -88,6 +92,12 @@ GitHub release 下载到 `~/.pi/`。
     "denyWindowLimit": 10,
     "denyWindowSize": 50
   },
+  "notifications": {
+    "enabled": true,
+    "onManualPrompt": true,
+    "onBreakerTrip": true,
+    "protocol": "auto"
+  },
   "rules": {
     "allow": ["Bash(npm run:*)"],
     "deny": ["Bash(rm -rf /)"],
@@ -122,6 +132,7 @@ GitHub release 下载到 `~/.pi/`。
 | `/perm allow\|deny\|ask <Tool(content)>` | 添加规则,如 `/perm allow Bash(npm run:*)` |
 | `/perm remove <Tool(content)>` | 移除规则 |
 | `/perm model [provider/modelId]` | 查看/设置分类器模型(`-` 恢复为当前会话模型) |
+| `/perm notify [on\|off\|message]` | 开关终端通知,或发送一条测试通知(可带自定义消息) |
 | `/perm pause` / `/perm resume` | 暂停/恢复拦截 |
 
 人工确认对话框选项:
@@ -161,6 +172,15 @@ GitHub release 下载到 `~/.pi/`。
 - 裸 shell(`bash`、`sh`、`sudo`…)不允许生成 allow 前缀规则
 - 单轮内自动审查拒绝过多会触发熔断并中断整个 turn
 
+## 终端通知(otty 等)
+
+需要人工确认、或熔断中断 turn 时,门神会向终端发一条通知。在 otty 中这表现为 macOS 原生横幅(需要在系统设置 → 通知 → otty 中开启权限)。
+
+- **协议自动检测**:otty/kitty → OSC 99,Ghostty/iTerm2 → OSC 9,WezTerm/urxvt/Windows Terminal → OSC 777,未知终端按 otty 官方推荐级联 99→777→9;tmux 内自动 DCS 透传
+- **测试**:`/perm notify` 发一条测试通知;`/perm notify on|off` 开关
+- **配置**:`notifications.enabled` 总开关;`onManualPrompt` / `onBreakerTrip` 分别控制两个触发点;`protocol` 可固定为 `osc99`/`osc9`/`osc777`/`cascade`(默认 `auto` 自动检测)
+- **降级**:rpc/print 等非 TTY 环境下无法发 OSC,自动改为应用内提示
+
 ## 开发
 
 ```bash
@@ -180,6 +200,7 @@ parser.ts       # tree-sitter bash 解析:子命令拆分、重定向提取
 bash.ts         # 命令分析:只读识别、包装器/环境变量剥离、危险模式、敏感路径
 classifier.ts   # Guardian 自动审核:transcript 重建、结构化 JSON、只读查证、重试、审核会话复用
 policy.ts       # 审核策略(风险分类学 + 输出契约),作为 system prompt 发给审核模型
+notify.ts       # 终端通知:OSC 9/777/99 序列构建、协议自动检测、tmux 透传
 config.ts       # 配置/规则持久化(~/.pi/pi-menshen.json)
 tree-sitter-bash.wasm  # 随扩展分发的语法(下载自 tree-sitter-bash v0.25.1)
 ```

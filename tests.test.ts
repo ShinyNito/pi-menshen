@@ -544,3 +544,143 @@ describe("guardian deterministic review flags", () => {
     assert.deepEqual(flags, []);
   });
 });
+
+// ============================================================================
+// Terminal notifications (OSC 9 / 777 / 99)
+// ============================================================================
+
+import {
+  buildOscSequences,
+  detectNotifyProtocol,
+  emitOsc,
+  sanitizeOsc,
+  wrapForTmux,
+} from "./notify.ts";
+
+describe("notify protocol detection", () => {
+  it("detects otty via TERM_PROGRAM", () => {
+    assert.equal(detectNotifyProtocol({ TERM_PROGRAM: "otty" }), "osc99");
+  });
+
+  it("detects kitty via KITTY_WINDOW_ID", () => {
+    assert.equal(detectNotifyProtocol({ KITTY_WINDOW_ID: "1" }), "osc99");
+  });
+
+  it("detects ghostty via TERM_PROGRAM", () => {
+    assert.equal(detectNotifyProtocol({ TERM_PROGRAM: "ghostty" }), "osc9");
+  });
+
+  it("detects iTerm2 via TERM_PROGRAM or ITERM_SESSION_ID", () => {
+    assert.equal(detectNotifyProtocol({ TERM_PROGRAM: "iTerm.app" }), "osc9");
+    assert.equal(detectNotifyProtocol({ ITERM_SESSION_ID: "x" }), "osc9");
+  });
+
+  it("detects wezterm / windows terminal via WT_SESSION", () => {
+    assert.equal(detectNotifyProtocol({ TERM_PROGRAM: "WezTerm" }), "osc777");
+    assert.equal(detectNotifyProtocol({ WT_SESSION: "x" }), "osc777");
+  });
+
+  it("detects rxvt family via TERM", () => {
+    assert.equal(detectNotifyProtocol({ TERM: "rxvt-unicode-256color" }), "osc777");
+  });
+
+  it("unknown terminals fall back to cascade", () => {
+    assert.equal(detectNotifyProtocol({ TERM: "xterm-256color" }), "cascade");
+    assert.equal(detectNotifyProtocol({}), "cascade");
+  });
+
+  it("apple terminal and alacritty are unsupported", () => {
+    assert.equal(detectNotifyProtocol({ TERM_PROGRAM: "Apple_Terminal" }), null);
+    assert.equal(detectNotifyProtocol({ TERM: "alacritty" }), null);
+  });
+});
+
+describe("notify OSC sequence building", () => {
+  it("builds osc99 title + body chunks with a shared id", () => {
+    const seqs = buildOscSequences("Build finished", "42 files", "osc99", { id: "deploy" });
+    assert.deepEqual(seqs, [
+      "\x1b]99;i=deploy:p=title:d=0;Build finished\x1b\\",
+      "\x1b]99;i=deploy:p=body;42 files\x1b\\",
+    ]);
+  });
+
+  it("defaults the osc99 id to menshen", () => {
+    const [first] = buildOscSequences("T", "B", "osc99");
+    assert.ok(first!.startsWith("\x1b]99;i=menshen:"));
+  });
+
+  it("builds osc9 as body-only", () => {
+    assert.deepEqual(buildOscSequences("Deploy", "Production is live", "osc9"), [
+      "\x1b]9;Deploy — Production is live\x07",
+    ]);
+  });
+
+  it("builds osc777 as title;body", () => {
+    assert.deepEqual(buildOscSequences("Deploy", "Production is live", "osc777"), [
+      "\x1b]777;notify;Deploy;Production is live\x07",
+    ]);
+  });
+
+  it("cascade emits 99 then 777 then 9", () => {
+    const seqs = buildOscSequences("T", "B", "cascade");
+    assert.equal(seqs.length, 4);
+    assert.ok(seqs[0]!.startsWith("\x1b]99;"));
+    assert.ok(seqs[1]!.startsWith("\x1b]99;"));
+    assert.ok(seqs[2]!.startsWith("\x1b]777;"));
+    assert.ok(seqs[3]!.startsWith("\x1b]9;"));
+  });
+
+  it("null protocol emits nothing", () => {
+    assert.deepEqual(buildOscSequences("T", "B", null), []);
+  });
+
+  it("sanitizes control characters and collapses whitespace", () => {
+    assert.equal(sanitizeOsc("a\nb\x1b]c"), "a b ]c");
+    assert.equal(sanitizeOsc("  hi   there  "), "hi there");
+  });
+
+  it("strips semicolons in osc777 fields", () => {
+    const [seq] = buildOscSequences("a;b", "c;d", "osc777");
+    assert.equal(seq, "\x1b]777;notify;a·b;c·d\x07");
+  });
+});
+
+describe("notify emission", () => {
+  it("wraps sequences for tmux DCS passthrough", () => {
+    assert.equal(wrapForTmux("\x1b]9;hi\x07"), "\x1bPtmux;\x1b\x1b]9;hi\x07\x1b\\");
+  });
+
+  it("emits nothing on non-TTY targets", () => {
+    const writes: string[] = [];
+    const emitted = emitOsc(["\x1b]9;hi\x07"], {
+      isTTY: false,
+      tmux: false,
+      write: (s) => writes.push(s),
+    });
+    assert.equal(emitted, false);
+    assert.deepEqual(writes, []);
+  });
+
+  it("emits sequences on a TTY target", () => {
+    const writes: string[] = [];
+    const emitted = emitOsc(["\x1b]9;hi\x07"], {
+      isTTY: true,
+      tmux: false,
+      write: (s) => writes.push(s),
+    });
+    assert.equal(emitted, true);
+    assert.deepEqual(writes, ["\x1b]9;hi\x07"]);
+  });
+
+  it("wraps every sequence under tmux", () => {
+    const writes: string[] = [];
+    emitOsc(["\x1b]9;a\x07", "\x1b]9;b\x07"], {
+      isTTY: true,
+      tmux: true,
+      write: (s) => writes.push(s),
+    });
+    assert.equal(writes.length, 2);
+    assert.ok(writes[0]!.startsWith("\x1bPtmux;"));
+    assert.ok(writes[1]!.startsWith("\x1bPtmux;"));
+  });
+});

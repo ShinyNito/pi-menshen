@@ -32,6 +32,10 @@ Runs permanently in **auto-review mode** (no mode switching): rule engine → de
   - Read-only commands (`ls`, `git status`, `npm ls`, …) auto-allow
   - In-project non-sensitive file writes/edits auto-allow; sensitive paths (`.env`, lockfiles, CI configs) go to review
   - Session cache: identical calls are reviewed only once
+- **Terminal notifications** (OSC 9 / 777 / 99, native in otty)
+  - Notifies you when the gate needs human attention: manual confirmation required, or the circuit breaker interrupts a turn
+  - Protocol auto-detected: otty/kitty → OSC 99, Ghostty/iTerm2 → OSC 9, WezTerm/urxvt → OSC 777, unknown terminals get the otty-recommended 99→777→9 cascade; tmux gets DCS passthrough automatically
+  - Non-TTY environments (rpc/print) fall back to in-app toasts; `/perm notify` sends a test notification
 - **Status display**: persistent footer `🔒 ✓n ✗n ⚠n` stats
 
 ## Install
@@ -68,6 +72,12 @@ Config file: `~/.pi/pi-menshen.json` (directory overridable via `PI_MENSHEN_DIR`
     "denyWindowLimit": 10,
     "denyWindowSize": 50
   },
+  "notifications": {
+    "enabled": true,
+    "onManualPrompt": true,
+    "onBreakerTrip": true,
+    "protocol": "auto"
+  },
   "rules": {
     "allow": ["Bash(npm run:*)"],
     "deny": ["Bash(rm -rf /)"],
@@ -93,6 +103,15 @@ Set `classifierModel` to `"provider/modelId"`, use `pi --list-models` to list av
 - Recommended: configure a cheap dedicated model for review to avoid main-model token consumption
 - `/reload` after changes; `/perm` shows the currently active model
 
+## Terminal notifications (otty & co.)
+
+When the gate needs human attention (manual confirmation required, or the circuit breaker interrupts the turn), pi-menshen sends a notification to your terminal emulator. In otty this renders as a native macOS banner (grant permission in System Settings → Notifications → otty).
+
+- **Protocol auto-detection**: otty/kitty → OSC 99, Ghostty/iTerm2 → OSC 9, WezTerm/urxvt/Windows Terminal → OSC 777, unknown terminals get the otty-recommended 99→777→9 cascade; tmux gets DCS passthrough automatically
+- **Test**: `/perm notify` sends a test notification; `/perm notify on|off` toggles
+- **Config**: `notifications.enabled` master switch; `onManualPrompt` / `onBreakerTrip` control the two triggers; `protocol` can be pinned to `osc99`/`osc9`/`osc777`/`cascade` (default `auto` = detect)
+- **Fallback**: in non-TTY modes (rpc/print) OSC cannot be emitted, so it falls back to an in-app toast
+
 ## Commands
 
 | Command | Description |
@@ -102,6 +121,7 @@ Set `classifierModel` to `"provider/modelId"`, use `pi --list-models` to list av
 | `/perm allow\|deny\|ask <Tool(content)>` | Add a rule, e.g. `/perm allow Bash(npm run:*)` |
 | `/perm remove <Tool(content)>` | Remove a rule |
 | `/perm model [provider/modelId]` | View/set the classifier model (`-` resets to session model) |
+| `/perm notify [on\|off\|message]` | Toggle terminal notifications, or send a test notification (with optional custom message) |
 | `/perm pause` / `/perm resume` | Pause/resume interception |
 
 Manual confirmation dialog options:
@@ -161,6 +181,7 @@ parser.ts       # tree-sitter bash parsing: sub-command splitting, redirection e
 bash.ts         # command analysis: read-only detection, wrapper/env stripping, danger patterns, sensitive paths
 classifier.ts   # Guardian auto-review: transcript reconstruction, structured JSON, read-only checks, retry, reviewer session
 policy.ts       # review policy (risk taxonomy + output contract), shipped to the reviewer as system prompt
+notify.ts       # terminal notifications: OSC 9/777/99 builders, protocol auto-detection, tmux passthrough
 config.ts       # config/rule persistence (~/.pi/pi-menshen.json)
 tree-sitter-bash.wasm  # shipped grammar (downloaded from tree-sitter-bash v0.25.1)
 ```
