@@ -221,11 +221,13 @@ export class PermissionDialog implements Component {
   }
 }
 
-/** Show the panel-style permission dialog; resolves to the user's choice (null = esc). */
+/** Show the permission panel docked at the bottom (editor area, like ctx.ui.select); resolves to the user's choice (null = esc). */
 export async function showPermissionDialog(
   ctx: ExtensionContext,
   data: PermissionDialogData,
 ): Promise<PermissionChoice | null> {
+  // No `overlay: true`: renders in the editor container at the bottom of the
+  // screen instead of a centered floating popup.
   return ctx.ui.custom<PermissionChoice | null>(
     (tui, theme, _kb, done) => {
       const dialog = new PermissionDialog(theme, data);
@@ -239,10 +241,6 @@ export async function showPermissionDialog(
           tui.requestRender();
         },
       };
-    },
-    {
-      overlay: true,
-      overlayOptions: { width: "72%", minWidth: 56, maxHeight: "85%", anchor: "center" },
     },
   );
 }
