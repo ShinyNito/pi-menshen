@@ -19,10 +19,12 @@ Runs permanently in **auto-review mode** (no mode switching): rule engine → de
   - Parse failure → fail-closed: skip the deterministic fast path, hand over to the auto-review model
 - **Auto-review mode** (core, Guardian-style)
   - When no rule matches, a dedicated **reviewer model** assesses the exact planned action against the governing user request and surrounding transcript
+  - The reviewer is a **real agent session** (Guardian-style): spawned with the review policy as its system prompt and only read-only tools (`read`/`grep`/`find`/`ls`) — no shell, no writes, no network, and no other extensions bound (no gate inside the gate)
+  - The reviewer session is **reused as a trunk across reviews**: its own conversation keeps the policy + prior reviews (stable prompt-cache prefix), and each review appends only the **parent-transcript delta** since the last review
   - Outputs structured JSON: `{ risk_level, user_authorization, outcome: allow|deny, rationale }` (low risk may return `{"outcome":"allow"}`)
-  - The reviewer sees a **reconstructed transcript** (user intent + recent assistant/tool context, token-budgeted) as untrusted evidence
-  - The reviewer can run **read-only verification** (`ls`, `stat`, `git status`, …) against local state before deciding
-  - The reviewer conversation is **reused across reviews** (delta transcript, stable prompt-cache prefix)
+  - The reviewer sees a **reconstructed compact transcript** (user intent + recent assistant/tool context, token-budgeted) as untrusted evidence
+  - The reviewer can run **read-only verification** with its real tools (`read`, `grep`, `find`, `ls`) against local state before deciding (policy caps it at 3 checks)
+  - **A failed review discards the trunk**: a fresh reviewer session is spawned on the next review, so a polluted conversation never leaks across reviews
   - **Rejection circuit breaker**: too many auto-review denials in one turn (3 consecutive / 10 in the last 50) interrupts the turn; denials carry no-bypass guidance
   - A definitive reviewer deny is **fed back to the agent** as a tool error result (rationale + no-bypass guidance), so it can propose a safer alternative; the manual dialog is only shown when the reviewer could not decide (timeout / failure / deterministic REVIEW)
   - Timeout / error / malformed output always fail closed → manual review (fail-safe)
@@ -104,7 +106,7 @@ Set `classifierModel` to `"provider/modelId"`, use `pi --list-models` to list av
 "classifierModel": "kimi-coding/kimi-for-coding-highspeed"
 
 # e.g. an openai mini model
-"classifierModel": "openai-codex/gpt-5.4-mini"
+"classifierModel": "openai/gpt-4.1-mini"
 ```
 
 - Leave empty (`""`) = use the current session model (always works, but shares the main model's quota/context)
@@ -150,8 +152,8 @@ tool call
   │      └─ write/edit to non-sensitive in-project path → allow
   ├─ 4. Guardian auto-review
   │      ├─ deterministic risk signals (secrets/dangerous commands/injection) → manual REVIEW (no LLM call)
-  │      ├─ reviewer rebuilds a compact transcript (delta reuse) + planned action
-  │      ├─ reviewer may run read-only checks (allowlist) to verify local state
+  │      ├─ spawn-or-reuse a real reviewer session (policy = system prompt, read-only tools)
+  │      ├─ append only the parent-transcript delta since the last review + planned action
   │      ├─ strict JSON: {risk_level, user_authorization, outcome, rationale}
   │      ├─ allow → approved
   │      └─ deny → result fed back to the agent (rationale + no-bypass guidance);
@@ -202,7 +204,8 @@ Config (defaults are fine):
 
 - All inputs are treated as untrusted data; the policy explicitly forbids following instructions inside inputs (prompt-injection defense)
 - The reviewer must return strict JSON; malformed output, timeout, and errors fail closed (deny → manual review)
-- The reviewer may only run allowlist read-only checks (`ls`, `stat`, `git status`, …) with no shell; compound commands, redirections, and shell expansion are rejected
+- The reviewer is an isolated agent session with only read-only tools (`read`/`grep`/`find`/`ls`); no shell, no writes, no network; no other extensions are bound, so no gate runs inside the gate (no recursion)
+- A failed/aborted review discards the reviewer session and fails closed; the next review starts a fresh session with the full transcript
 - In non-interactive mode (rpc/print) manual confirmation is unavailable and the default is **deny** (fail-closed)
 - deny rules strip all leading env vars (`FOO=bar rm -rf /` still matches `Bash(rm:*)`)
 - Bare shells (`bash`, `sh`, `sudo`, …) cannot generate allow prefix rules
@@ -214,6 +217,8 @@ Config (defaults are fine):
 bun x tsc --noEmit   # type check (or: pnpm typecheck)
 pnpm install         # install dev dependencies (peer deps for type checking)
 node --experimental-strip-types --test tests.test.ts   # smoke tests (or: pnpm test)
+node --experimental-strip-types smoke-review.ts       # live auto-review smoke test (real model, spawns a real reviewer session)
+node --experimental-strip-types smoke-ui.ts           # TUI layout smoke test
 ```
 
 Requires node ≥ 22.6 (native TypeScript type stripping, used by the test runner).
@@ -225,7 +230,7 @@ index.ts        # entry: event wiring, decision pipeline, circuit breaker, /perm
 rules.ts        # rule engine: parsing, exact/prefix/wildcard matching, path rules
 parser.ts       # tree-sitter bash parsing: sub-command splitting, redirection extraction
 bash.ts         # command analysis: read-only detection, wrapper/env stripping, danger patterns, sensitive paths
-classifier.ts   # Guardian auto-review: transcript reconstruction, structured JSON, read-only checks, retry, reviewer session
+classifier.ts   # Guardian auto-review: real reviewer session (spawn/trunk reuse), delta transcript, structured JSON, retry
 policy.ts       # review policy (risk taxonomy + output contract), shipped to the reviewer as system prompt
 notify.ts       # terminal notifications: OSC 9/777/99 builders, protocol auto-detection, tmux passthrough
 config.ts       # config/rule persistence (~/.pi/pi-menshen.json)

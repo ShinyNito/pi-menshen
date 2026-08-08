@@ -19,10 +19,12 @@
   - 解析失败 → fail-closed:跳过确定性快路径,交由自动审核模型判断
 - **自动审核模式**(核心,Guardian 式)
   - 规则未命中时,由**专用审核模型**审查「计划动作 + 支配请求 + 周边对话」
+  - 审核者是一个**真正的 agent 会话**(Guardian 式):以审核策略作为 system prompt 创建,只挂只读工具(`read`/`grep`/`find`/`ls`)——无 shell、无写入、无网络,也不绑定任何其他扩展(门内无门,不会递归)
+  - 审核会话作为 **trunk 跨审查复用**:它自己的对话持有策略 + 历次审查(稳定 prompt-cache 前缀),每次审查只追加**父会话 transcript 自上次审查以来的增量**
   - 输出结构化 JSON:`{ risk_level, user_authorization, outcome: allow|deny, rationale }`(低风险可直接 `{"outcome":"allow"}`)
   - 审核模型看到的是**重建的紧凑 transcript**(用户意图 + 最近的助手/工具上下文,带 token 预算),全部视为不可信证据
-  - 审核模型可执行**只读查证**(`ls`、`stat`、`git status`…)核实本地状态后再下结论
-  - 审核对话**跨审查复用**(delta 增量 transcript,稳定 prompt-cache 前缀)
+  - 审核模型可以用它的真实只读工具(`read`/`grep`/`find`/`ls`)做**只读查证**核实本地状态(策略限制最多 3 次)
+  - **审查失败即丢弃 trunk**:下次审查重新 spawn 全新会话,被污染的对话不会泄漏到后续审查
   - **拒绝熔断**:单轮内自动审查拒绝过多(连续 3 次 / 最近 50 次中 10 次)即中断整个 turn;拒绝附带禁止绕过指引
   - 审查模型的明确拒绝会**直接回传给 agent**(工具错误结果,含理由 + 禁止绕过指引),让 agent 提出更安全的替代方案;人工确认框只在审查模型无法决定时出现(超时/失败/确定性 REVIEW)
   - 超时/错误/格式异常一律 fail-closed → 人工(fail-safe)
@@ -124,7 +126,7 @@ GitHub release 下载到 `~/.pi/`。
 "classifierModel": "kimi-coding/kimi-for-coding-highspeed"
 
 # 例:用 openai 的 mini 模型
-"classifierModel": "openai-codex/gpt-5.4-mini"
+"classifierModel": "openai/gpt-4.1-mini"
 ```
 
 - **留空**(`""`)= 用当前会话模型(保证可用,但与主模型共享配额/上下文)
@@ -161,8 +163,8 @@ GitHub release 下载到 `~/.pi/`。
   │      └─ write/edit 项目内非敏感路径 → 放行
   ├─ 4. Guardian 自动审核
   │      ├─ 确定性风险特征(密钥/危险命令/注入)→ REVIEW(不调 LLM)
-  │      ├─ 重建紧凑 transcript(delta 复用)+ 计划动作
-  │      ├─ 审核模型可跑只读查证(白名单命令)核实本地状态
+  │      ├─ spawn/复用真正的审核会话(策略作 system prompt,只读工具)
+  │      ├─ 只追加父会话 transcript 自上次审查以来的增量 + 计划动作
   │      ├─ 严格 JSON:{risk_level, user_authorization, outcome, rationale}
   │      ├─ allow → 放行
   │      └─ deny → 结果回传给 agent(理由 + 禁止绕过指引);熔断在连续拒绝后中断本轮
@@ -174,7 +176,8 @@ GitHub release 下载到 `~/.pi/`。
 
 - 所有输入视为不可信数据;策略(policy)显式禁止跟随输入中的指令(防提示注入)
 - 审核模型必须返回严格 JSON;格式异常、超时、错误一律 fail-closed(deny → 人工)
-- 审核模型只能执行白名单只读查证(`ls`、`stat`、`git status`…),无 shell;复合命令、重定向、shell 展开一律拒绝
+- 审核者是一个隔离的 agent 会话,只有只读工具(`read`/`grep`/`find`/`ls`);无 shell、无写入、无网络;不绑定任何其他扩展,门内无门(不会递归)
+- 审查失败/中止即丢弃审核会话并 fail-closed;下次审查从全新会话 + 全量 transcript 开始
 - 非交互模式(rpc/print)下人工确认不可用时默认**拒绝**(fail-closed)
 - deny 规则剥离全部前导环境变量(`FOO=bar rm -rf /` 仍命中 `Bash(rm:*)`)
 - 裸 shell(`bash`、`sh`、`sudo`…)不允许生成 allow 前缀规则
@@ -233,6 +236,8 @@ subagent(headless)                  主会话(交互式)
 bun x tsc --noEmit   # 类型检查
 pnpm install         # 安装依赖(dev 依赖含 pi peer 包,供类型检查)
 node --experimental-strip-types --test tests.test.ts   # 冒烟测试
+node --experimental-strip-types smoke-review.ts       # 真实自动审核冒烟测试(真实模型,spawn 真实审核会话)
+node --experimental-strip-types smoke-ui.ts           # TUI 布局冒烟测试
 ```
 
 需要 node ≥ 22.6(测试运行器依赖原生 TypeScript 类型剥离)。
@@ -244,7 +249,7 @@ index.ts        # 入口:事件接线、决策管线、熔断器、/perm 命令
 rules.ts        # 规则引擎:解析、精确/前缀/通配匹配、路径规则
 parser.ts       # tree-sitter bash 解析:子命令拆分、重定向提取
 bash.ts         # 命令分析:只读识别、包装器/环境变量剥离、危险模式、敏感路径
-classifier.ts   # Guardian 自动审核:transcript 重建、结构化 JSON、只读查证、重试、审核会话复用
+classifier.ts   # Guardian 自动审核:真实审核会话(spawn/trunk 复用)、delta transcript、结构化 JSON、重试
 policy.ts       # 审核策略(风险分类学 + 输出契约),作为 system prompt 发给审核模型
 notify.ts       # 终端通知:OSC 9/777/99 序列构建、协议自动检测、tmux 透传
 config.ts       # 配置/规则持久化(~/.pi/pi-menshen.json)

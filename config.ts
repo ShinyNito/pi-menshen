@@ -66,7 +66,7 @@ export interface RelayConfig {
 /** Guardian auto-review settings (model-review layer) */
 export interface GuardianConfig {
   /**
-   * Max model attempts per review for transient failures (Codex: 3).
+   * Max model attempts per review for transient failures (default: 3).
    * Non-transient failures fail closed immediately.
    */
   maxAttempts: number;

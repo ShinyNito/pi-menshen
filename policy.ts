@@ -117,13 +117,5 @@ For anything else, use this JSON schema:
 }
 \`\`\`
 
-You may request read-only verification of local state before deciding. To do
-so, call the \`read_only_check\` tool with a single read-only command.
-
-Allowed check commands are a strict allowlist: \`ls\`, \`cat\` (limited), \`stat\`,
-\`find\` (limited), \`head\`, \`tail\`, \`wc\`, \`file\`, \`pwd\`, \`test\`, \`git status\`,
-\`git log\`, \`git diff\`, \`git show\`, \`git branch\`, \`git remote\`,
-\`git rev-parse\`, \`git ls-files\`. Use them to verify file existence, path
-scope, and repo state. You can make up to 3 checks per review. Never request
-a check that writes, deletes, installs, or reaches the network.
+You may request read-only verification of local state before deciding. You have exactly four tools — \`read\`, \`grep\`, \`find\`, \`ls\`. Use them to verify file existence, path scope, and repo state. You can make up to 3 checks per review. Never attempt a check that writes, deletes, installs, or reaches the network: the shell, edit, write, and network tools are not available to you.
 `;

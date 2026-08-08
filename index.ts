@@ -48,6 +48,7 @@ import {
 import {
   classifyRequest,
   createReviewerSession,
+  disposeReviewerSession,
   type ClassifierResult,
   type GuardianAssessment,
   type ReviewPhase,
@@ -88,7 +89,7 @@ const BARE_SHELL_PREFIXES = new Set([
   "timeout", "time", "sudo", "doas", "pkexec",
 ]);
 
-/** Denial feedback appended to blocked actions (mirrors Codex GUARDIAN_REJECTION_INSTRUCTIONS). */
+/** Denial feedback appended to blocked actions (no-bypass guidance). */
 const REJECTION_INSTRUCTIONS =
   "The agent must not attempt to achieve the same outcome via workaround, indirect execution, or policy circumvention. Proceed only with a materially safer alternative, or if the user explicitly approves the action after being informed of the risk. Otherwise, stop and request user input.";
 
@@ -113,7 +114,7 @@ interface SessionState {
 }
 
 // ============================================================================
-// Rejection circuit breaker (per turn; mirrors Codex GuardianRejectionCircuitBreaker)
+// Rejection circuit breaker (per turn)
 // ============================================================================
 
 /** Record a review outcome for the current turn; returns true when the breaker trips. */
@@ -262,7 +263,7 @@ async function decideToolCall(
   }
 
   // ---------- 4. Auto-review denial: return the result to the agent (no manual dialog) ----------
-  // Mirroring Codex: a definitive Guardian deny is fed back to the agent as a tool
+  // A definitive Guardian deny is fed back to the agent as a tool
   // error result (rationale + no-bypass guidance) so it can propose a safer
   // alternative. The manual dialog is reserved for cases the reviewer could not
   // decide (timeout / failure / deterministic REVIEW). The rejection circuit
@@ -327,8 +328,8 @@ function updateReviewUi(ctx: ExtensionContext, state: SessionState, phase: Revie
       ctx.ui.setWorkingMessage("🔒 menshen auto-review in progress…");
       break;
     case "check":
-      ctx.ui.setStatus("perm", statusVerifying(ctx.ui.theme, phase.command));
-      ctx.ui.setWorkingMessage(`🔒 menshen verifying: ${phase.command}`);
+      ctx.ui.setStatus("perm", statusVerifying(ctx.ui.theme, phase.tool));
+      ctx.ui.setWorkingMessage(`🔒 menshen verifying: ${phase.tool}`);
       break;
     case "end":
       ctx.ui.setWorkingMessage(); // restore default
@@ -770,6 +771,11 @@ export default function piPermission(pi: ExtensionAPI): void {
   const offRelayResponder = installRelayResponder(() => state);
 
   const refreshState = (ctx: ExtensionContext): SessionState => {
+    // If a state is being replaced (e.g. /reload re-runs the extension), shut
+    // down the old reviewer trunk so its session is not leaked.
+    if (state && state.reviewer.session) {
+      disposeReviewerSession(state.reviewer);
+    }
     const next: SessionState = {
       config: loadConfig(),
       projectRules: loadProjectRules(ctx.cwd),
@@ -792,6 +798,10 @@ export default function piPermission(pi: ExtensionAPI): void {
   });
 
   pi.on("session_shutdown", () => {
+    // Shut down the reviewer trunk with the session.
+    if (state && state.reviewer.session) {
+      disposeReviewerSession(state.reviewer);
+    }
     offRelayResponder();
     state = undefined;
   });

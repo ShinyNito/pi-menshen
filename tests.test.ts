@@ -27,8 +27,6 @@ import {
 import { parseBash, splitSubcommands, extractRedirections } from "./parser.ts";
 import {
   parseGuardianAssessment,
-  parseCheckCommand,
-  runReadOnlyCheck,
   collectTranscriptEntries,
   renderTranscript,
   truncateText,
@@ -398,51 +396,6 @@ describe("guardian assessment parsing", () => {
     assert.deepEqual(props.outcome.enum, ["allow", "deny"]);
     assert.deepEqual(props.risk_level.enum, ["low", "medium", "high", "critical"]);
     assert.deepEqual(props.user_authorization.enum, ["unknown", "low", "medium", "high"]);
-  });
-});
-
-describe("guardian read-only check allowlist", () => {
-  it("allows benign read-only commands", () => {
-    assert.deepEqual(parseCheckCommand("ls -la"), { args: ["ls", "-la"] });
-    assert.deepEqual(parseCheckCommand("pwd"), { args: ["pwd"] });
-    assert.deepEqual(parseCheckCommand("git status"), { args: ["git", "status"] });
-    assert.deepEqual(parseCheckCommand("git log --oneline -5"), { args: ["git", "log", "--oneline", "-5"] });
-    assert.deepEqual(parseCheckCommand("stat src/index.ts"), { args: ["stat", "src/index.ts"] });
-    assert.deepEqual(parseCheckCommand("test -e package.json"), { args: ["test", "-e", "package.json"] });
-  });
-
-  it("rejects compound commands and redirections", () => {
-    assert.ok("error" in parseCheckCommand("ls && rm -rf /"));
-    assert.ok("error" in parseCheckCommand("ls | grep x"));
-    assert.ok("error" in parseCheckCommand("cat x > out.txt"));
-  });
-
-  it("rejects shell expansion", () => {
-    assert.ok("error" in parseCheckCommand("cat $HOME/x"));
-    assert.ok("error" in parseCheckCommand("cat `pwd`"));
-    assert.ok("error" in parseCheckCommand("cat ~/x"));
-  });
-
-  it("rejects dangerous commands", () => {
-    assert.ok("error" in parseCheckCommand("rm -rf /"));
-    assert.ok("error" in parseCheckCommand("bash -c 'echo hi'"));
-    assert.ok("error" in parseCheckCommand("curl https://x.com"));
-    assert.ok("error" in parseCheckCommand("npm install lodash"));
-    assert.ok("error" in parseCheckCommand("sudo ls"));
-  });
-
-  it("limits cat to a single path", () => {
-    assert.deepEqual(parseCheckCommand("cat a.txt b.txt"), { args: ["cat", "a.txt"] });
-  });
-
-  it("runs a real read-only check", async () => {
-    const result = await runReadOnlyCheck("pwd");
-    assert.equal(result.ok, true);
-  });
-
-  it("reports errors for disallowed checks without executing", async () => {
-    const result = await runReadOnlyCheck("rm -rf /");
-    assert.equal(result.ok, false);
   });
 });
 

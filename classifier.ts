@@ -1,41 +1,45 @@
 /**
  * pi-menshen — Guardian-style auto-review classifier
  *
- * Model auto-review aligned with Codex's Guardian design:
+ * Model auto-review in the Guardian style:
  *
- *   1. Reconstruct a compact transcript (user intent + recent assistant/tool
- *      context) with token budgets — user/assistant messages and tool evidence
- *      draw from separate pools; the first and last user turns are always kept.
- *   2. Ask a dedicated reviewer conversation to assess the exact planned
- *      action and return strict JSON:
+ *   1. The reviewer is a REAL pi agent session (createAgentSession), spawned
+ *      with the review policy as its system prompt and ONLY read-only tools
+ *      (read / grep / find / ls). No shell, no writes, no network — and no
+ *      other extensions bound, so no gate can run inside the gate.
+ *   2. The reviewer session is reused across reviews as a "trunk": its own
+ *      conversation keeps the policy + prior review/assessment history, so
+ *      each review only appends the PARENT-transcript delta since the last
+ *      review (Guardian delta-cursor semantics).
+ *   3. The reviewer answers with strict JSON:
  *      { risk_level, user_authorization, outcome: allow|deny, rationale }.
- *      The reviewer may request read-only verification of local state
- *      (allowlist commands, no shell) before deciding.
- *   3. Fail closed on timeout, execution failure, or malformed output.
- *   4. Apply the reviewer's explicit allow/deny outcome.
- *
- * The reviewer conversation is reused across reviews (trunk-style): the fixed
- * policy is the stable system prompt, later reviews append only the transcript
- * delta since the last review, preserving a stable prompt-cache prefix.
+ *   4. Fail closed on timeout, execution failure, or malformed output; the
+ *      trunk is discarded on any non-completed review.
  *
  * Deterministic high-risk signals still skip the model entirely (cheaper and
- * non-bypassable) — matching Codex's layered approach where deterministic
+ * non-bypassable) — matching the layered approach where deterministic
  * gates run before the model.
  */
 
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
-import { completeSimple, type Message, type UserMessage } from "@earendil-works/pi-ai/compat";
+import type { Model } from "@earendil-works/pi-ai/compat";
+import {
+  AgentSession,
+  type AgentSessionEvent,
+  createAgentSession,
+  DefaultResourceLoader,
+  getAgentDir,
+  type ModelRuntime,
+  SessionManager,
+  SettingsManager,
+} from "@earendil-works/pi-coding-agent";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import type { PermissionConfig } from "./config.ts";
 import type { RuleMatchResult } from "./rules.ts";
 import { findDangerPatterns } from "./bash.ts";
 import { POLICY } from "./policy.ts";
 
-const execFileAsync = promisify(execFile);
-
 // ============================================================================
-// Assessment contract (mirrors Codex GuardianAssessment)
+// Assessment contract
 // ============================================================================
 
 export type GuardianRiskLevel = "low" | "medium" | "high" | "critical";
@@ -254,78 +258,121 @@ export function renderTranscript(entries: TranscriptEntry[]): { transcript: stri
 }
 
 // ============================================================================
-// Read-only verification (allowlist, no shell)
+// Reviewer session (real agent session, trunk reuse)
 // ============================================================================
 
-/** Allowed check commands. Each entry: regex to validate the full command line. */
-const CHECK_ALLOWLIST: Array<{ pattern: RegExp; transform?: (args: string[]) => string[] }> = [
-  { pattern: /^ls(?:[ \t]+-[ \t]*[a-zA-Z]*[ \t]*)?(?:[ \t]+[^\s;&|"'`$]+)*$/ }, // ls [-flags] [paths]
-  { pattern: /^pwd$/ },
-  { pattern: /^git (?:status|log|diff|show|branch|remote|rev-parse|ls-files)(?:[ \t]+[^\s;&|"'`$]+)*$/ },
-  { pattern: /^stat(?:[ \t]+[^\s;&|"'`$]+)+$/ },
-  { pattern: /^file(?:[ \t]+[^\s;&|"'`$]+)+$/ },
-  { pattern: /^wc(?:[ \t]+-[ \t]*[a-zA-Z]*)?(?:[ \t]+[^\s;&|"'`$]+)*$/ },
-  { pattern: /^head(?:[ \t]+-[ \t]*n?[0-9]+)?(?:[ \t]+[^\s;&|"'`$]+)*$/ },
-  { pattern: /^tail(?:[ \t]+-[ \t]*n?[0-9]+)?(?:[ \t]+[^\s;&|"'`$]+)*$/ },
-  { pattern: /^cat(?:[ \t]+[^\s;&|"'`$]+)+$/, transform: (args) => args.slice(0, 2) }, // limit to 1 path
-  { pattern: /^find[ \t]+[^\s;&|"'`$]+(?:[ \t]+-[ \t]*[a-zA-Z]+(?:[ \t]+[^\s;&|"'`$]+)?)*$/ },
-  { pattern: /^test(?:[ \t]+(?:-[a-z]|[^\s;&|"'`$~]+))+$/, transform: (args) => args.slice(0, 3) }, // test [op] path
-];
-
-const MAX_CHECK_OUTPUT_CHARS = 4_000;
-const MAX_CHECKS_PER_REVIEW = 3;
-const CHECK_TIMEOUT_MS = 4_000;
-
-/** Validate a reviewer-requested check command against the allowlist. */
-export function parseCheckCommand(command: string): { args: string[] } | { error: string } {
-  const trimmed = command.trim();
-  if (!trimmed) return { error: "empty check command" };
-  if (/[\n\r;&|<>]|&&|\|\|/.test(trimmed)) return { error: "compound/redirect not allowed" };
-  const tokens = trimmed.split(/\s+/);
-  if (tokens.some((t) => t.includes("$") || t.includes("`") || t.includes("\\") || t.includes("~"))) {
-    return { error: "shell expansion not allowed" };
-  }
-  for (const rule of CHECK_ALLOWLIST) {
-    if (rule.pattern.test(trimmed)) {
-      const args = rule.transform ? rule.transform(tokens) : tokens;
-      return { args };
-    }
-  }
-  return { error: `command not in allowlist: ${trimmed}` };
+export interface ReviewerSessionState {
+  /** The live reviewer agent session (trunk), or null when none is spawned. */
+  session: AgentSession | null;
+  /** Reuse key: model id + cwd. A mismatch respawns the trunk. */
+  key: string;
+  /** Parent transcript entry count at the last committed review (delta baseline). */
+  lastEntryCount: number;
+  /** Read-only checks performed across the session (for analytics/display). */
+  totalChecks: number;
 }
 
-/** Run a read-only check via execFile (no shell). Truncates output. */
-export async function runReadOnlyCheck(command: string): Promise<{ ok: true; output: string } | { ok: false; error: string }> {
-  const parsed = parseCheckCommand(command);
-  if ("error" in parsed) return { ok: false, error: parsed.error };
-  try {
-    const { stdout, stderr } = await execFileAsync(parsed.args[0]!, parsed.args.slice(1), {
-      timeout: CHECK_TIMEOUT_MS,
-      maxBuffer: MAX_CHECK_OUTPUT_CHARS * 2,
-    });
-    const output = (stdout + (stderr ? `\n[stderr] ${stderr}` : "")).trim();
-    const truncated = output.length > MAX_CHECK_OUTPUT_CHARS;
-    return {
-      ok: true,
-      output: truncated
-        ? `${output.slice(0, MAX_CHECK_OUTPUT_CHARS)}\n...[truncated ${output.length - MAX_CHECK_OUTPUT_CHARS} chars]...`
-        : output || "(no output)",
-    };
-  } catch (error) {
-    const err = error as { message?: string; code?: number | string };
-    return { ok: false, error: err?.message ?? String(error) };
+export function createReviewerSession(): ReviewerSessionState {
+  return { session: null, key: "", lastEntryCount: 0, totalChecks: 0 };
+}
+
+/**
+ * Shut down the reviewer trunk and clear its state. Safe to call any number of
+ * times; never throws. Used on review failure (the trunk is replaced after
+ * any non-completed review), on model/config change, and on session shutdown.
+ */
+export function disposeReviewerSession(state: ReviewerSessionState): void {
+  const session = state.session;
+  state.session = null;
+  state.key = "";
+  state.lastEntryCount = 0;
+  if (session) {
+    try {
+      session.dispose();
+    } catch {
+      // Dispose must not throw: the gate stays usable even if teardown fails.
+    }
   }
+}
+
+/** Reviewer tools: read-only, no shell, no network. */
+const REVIEWER_TOOLS = ["read", "grep", "find", "ls"];
+
+/** Reviewer thinking level — enough for the JSON judgment, cheap on tokens. */
+const REVIEWER_THINKING_LEVEL = "low" as const;
+
+/** Cap on checks reported in the result (the session is aborted past maxChecks anyway). */
+const MAX_REPORTED_CHECKS = 12;
+
+/**
+ * Spawn a fresh reviewer agent session. The review policy is the session's
+ * system prompt (stable prefix → prompt cache); tools are read-only; no other
+ * extensions are bound, so no gate runs inside the gate.
+ */
+export async function spawnReviewerSession(
+  ctx: ExtensionContext,
+  model: Model<any>,
+  cwd: string,
+): Promise<AgentSession> {
+  const agentDir = getAgentDir();
+  const settingsManager = SettingsManager.create(cwd, agentDir);
+  const loader = new DefaultResourceLoader({
+    cwd,
+    agentDir,
+    settingsManager,
+    noExtensions: true, // no menshen recursion, no other gates inside the reviewer
+    noSkills: true,
+    noPromptTemplates: true,
+    noThemes: true,
+    noContextFiles: true,
+    systemPrompt: POLICY, // the review policy IS the reviewer's system prompt
+  });
+  await loader.reload();
+
+  // Inherit the parent's model/auth runtime so configured providers and keys
+  // (including custom providers) resolve exactly as they do in the parent.
+  const parentRuntime = (ctx.modelRegistry as unknown as { runtime?: ModelRuntime }).runtime;
+
+  const { session } = await createAgentSession({
+    cwd,
+    agentDir,
+    modelRuntime: parentRuntime,
+    model,
+    thinkingLevel: REVIEWER_THINKING_LEVEL,
+    tools: REVIEWER_TOOLS,
+    resourceLoader: loader,
+    // In-memory session: no persistence; the stable session id keeps the
+    // reviewer conversation on the provider's prompt-cache prefix.
+    sessionManager: SessionManager.inMemory(cwd),
+    settingsManager,
+  });
+  session.setSessionName("menshen-review");
+  return session;
+}
+
+/** Extract plain text from an agent message content (string or content parts). */
+function extractMessageText(msg: { role?: string; content?: unknown }): string {
+  const content = msg.content;
+  if (typeof content === "string") return content;
+  if (Array.isArray(content)) {
+    return content
+      .filter(
+        (part): part is { type: "text"; text: string } =>
+          typeof part === "object" && part !== null &&
+          (part as { type?: string }).type === "text" &&
+          typeof (part as { text?: unknown }).text === "string",
+      )
+      .map((part) => part.text)
+      .join("");
+  }
+  return "";
 }
 
 // ============================================================================
 // Policy & output contract
 // ============================================================================
 
-
-
-const OUTPUT_CONTRACT = `You may request read-only verification of local state before deciding. To do so, call the read_only_check tool with a single read-only command.
-
-Allowed check commands: ls, cat (one path), stat, find, head, tail, wc, file, pwd, test, git status/log/diff/show/branch/remote/rev-parse/ls-files. Never request a check that writes, deletes, installs, or reaches the network. You can make up to 3 checks per review.
+const OUTPUT_CONTRACT = `You may request read-only verification of local state before deciding. You have exactly four tools — read, grep, find, ls. Use them to verify file existence, path scope, and repo state. You can make up to 3 checks per review. Never attempt a check that writes, deletes, installs, or reaches the network: the shell, edit, write, and network tools are not available to you.
 
 When ready to answer, your final message must be strict JSON.
 For low-risk actions, give the final answer directly:
@@ -349,7 +396,6 @@ export function guardianOutputSchema(): Record<string, unknown> {
       user_authorization: { type: "string", enum: ["unknown", "low", "medium", "high"] },
       outcome: { type: "string", enum: ["allow", "deny"] },
       rationale: { type: "string" },
-      check: { type: "string" },
     },
   };
 }
@@ -438,82 +484,27 @@ export function findDeterministicReviewFlags(req: ClassifierRequest): string[] {
 }
 
 // ============================================================================
-// Reviewer session (trunk-style reuse + delta)
+// Review execution (real reviewer session)
 // ============================================================================
 
-export interface ReviewerSessionState {
-  /** Stable id used for prompt caching (OpenAI prompt_cache_key / Anthropic session affinity) */
-  id: string;
-  /**
-   * Reviewer conversation turns (user/assistant/toolResult texts; the policy is
-   * the stable system prompt on every call). Kept so later reviews append only
-   * the transcript delta and reuse a stable prompt-cache prefix.
-   */
-  turns: ReviewTurn[];
-  /** Branch entry count at the last review (delta baseline) */
-  lastEntryCount: number;
-  /** Read-only checks performed across the session */
-  totalChecks: number;
+/** Progress phase reported to the caller for UI feedback during a review. */
+export type ReviewPhase =
+  | { kind: "start" }
+  | { kind: "check"; tool: string }
+  | { kind: "end" };
+
+export interface ReviewOptions {
+  /** Reviewer session state (trunk; reused across reviews for delta + caching) */
+  session: ReviewerSessionState;
+  /** Maximum model attempts for transient failures */
+  maxAttempts?: number;
+  /** Maximum read-only checks the reviewer may run per review */
+  maxChecks?: number;
+  /** Policy text (defaults to POLICY); override for tests */
+  policy?: string;
+  /** Called as the review progresses (for status/working-message UI). */
+  onPhase?: (phase: ReviewPhase) => void;
 }
-
-export interface ReviewTurn {
-  role: "user" | "assistant" | "toolResult";
-  text: string;
-  toolCallId?: string;
-  toolName?: string;
-  isError?: boolean;
-}
-
-export function createReviewerSession(): ReviewerSessionState {
-  return { id: `menshen-review-${crypto.randomUUID()}`, turns: [], lastEntryCount: 0, totalChecks: 0 };
-}
-
-/** Rebuild LLM messages from the reviewer conversation (provider-agnostic). */
-function buildMessages(conversation: ReviewTurn[]): Message[] {
-  return conversation.map((turn) => {
-    if (turn.role === "user") {
-      return {
-        role: "user",
-        content: [{ type: "text", text: turn.text }],
-        timestamp: Date.now(),
-      } as UserMessage;
-    }
-    if (turn.role === "toolResult") {
-      return {
-        role: "toolResult",
-        toolCallId: turn.toolCallId ?? "check-0",
-        toolName: turn.toolName ?? "read_only_check",
-        content: [{ type: "text", text: turn.text }],
-        isError: turn.isError ?? false,
-        timestamp: Date.now(),
-      } as unknown as Message;
-    }
-    return {
-      role: "assistant",
-      content: [{ type: "text", text: turn.text }],
-      api: "compat",
-      provider: "compat",
-      model: "compat",
-      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-      stopReason: "stop",
-      timestamp: Date.now(),
-    } as unknown as Message;
-  });
-}
-
-function conversationSize(turns: ReviewTurn[]): number {
-  let size = 0;
-  for (const turn of turns) size += turn.text.length;
-  return size;
-}
-
-/** Above this stored-conversation size, restart the review conversation (full transcript next time).
- * Sized generously so prompt-cache prefixes survive long sessions: ~80k tokens of stored turns. */
-const MAX_REVIEW_CONVERSATION_CHARS = 320_000;
-
-// ============================================================================
-// Model call helpers
-// ============================================================================
 
 type DeadlineOutcome<T> =
   | { status: "value"; value: T }
@@ -555,28 +546,84 @@ function awaitWithDeadline<T>(
   });
 }
 
+type ReviewTurnResult =
+  | { status: "value"; text: string }
+  | { status: "error"; message: string }
+  | { status: "timeout" }
+  | { status: "aborted" };
+
+/**
+ * Run one review turn on the reviewer session: prompt it, collect the final
+ * assistant text, and report the read-only checks it ran. The reviewer may
+ * call read/grep/find/ls; past `maxChecks` checks the session is aborted
+ * (fail-closed → manual, mirroring the old hard cap).
+ */
+async function runReviewTurn(
+  session: AgentSession,
+  prompt: string,
+  deadline: number,
+  outerSignal: AbortSignal | undefined,
+  options: ReviewOptions,
+  checks: string[],
+): Promise<ReviewTurnResult> {
+  let text = "";
+  let checkCount = 0;
+  const off = session.subscribe((event: AgentSessionEvent) => {
+    // message_start also fires for user and toolResult messages — reset only
+    // on a new ASSISTANT message so `text` is the LAST assistant message.
+    if (event.type === "message_start" && event.message.role === "assistant") {
+      text = "";
+    } else if (event.type === "message_update" && event.assistantMessageEvent.type === "text_delta") {
+      text += event.assistantMessageEvent.delta;
+    } else if (event.type === "tool_execution_start") {
+      checkCount++;
+      if (checks.length < MAX_REPORTED_CHECKS) checks.push(event.toolName);
+      options.onPhase?.({ kind: "check", tool: event.toolName });
+      if (options.maxChecks !== undefined && checkCount > options.maxChecks) {
+        // Check limit reached: abort the review (fail-closed → manual).
+        void session.abort();
+      }
+    }
+  });
+
+  try {
+    const outcome = await awaitWithDeadline(
+      (async () => {
+        await session.prompt(prompt, { expandPromptTemplates: false });
+        // Inspect how the final turn stopped (pi resolves exhausted-retries
+        // normally, so a failed turn must be detected via stopReason).
+        for (let i = session.messages.length - 1; i >= 0; i--) {
+          const msg = session.messages[i] as { role?: string; stopReason?: string; errorMessage?: string };
+          if (msg.role !== "assistant") continue;
+          if (msg.stopReason === "error") {
+            throw new Error(msg.errorMessage ?? "provider error with no output");
+          }
+          if (msg.stopReason === "length" && !extractMessageText(msg).trim()) {
+            throw new Error("review hit the output token limit before producing any text");
+          }
+          break;
+        }
+      })(),
+      outerSignal ?? new AbortController().signal,
+      deadline,
+    );
+
+    if (outcome.status === "aborted") return { status: "aborted" };
+    if (outcome.status === "timeout") return { status: "timeout" };
+    if (outcome.status === "error") {
+      return { status: "error", message: outcome.error instanceof Error ? outcome.error.message : String(outcome.error) };
+    }
+    const finalText = text.trim();
+    if (!finalText) return { status: "error", message: "empty reviewer response" };
+    return { status: "value", text: finalText };
+  } finally {
+    off();
+  }
+}
+
 // ============================================================================
 // Main entry
 // ============================================================================
-
-/** Progress phase reported to the caller for UI feedback during a review. */
-export type ReviewPhase =
-  | { kind: "start" }
-  | { kind: "check"; command: string }
-  | { kind: "end" };
-
-export interface ReviewOptions {
-  /** Reviewer conversation state (reused across reviews for delta + caching) */
-  session: ReviewerSessionState;
-  /** Maximum model attempts for transient failures */
-  maxAttempts?: number;
-  /** Maximum read-only checks per review */
-  maxChecks?: number;
-  /** Policy text (defaults to policy.md); override for tests */
-  policy?: string;
-  /** Called as the review progresses (for status/working-message UI). */
-  onPhase?: (phase: ReviewPhase) => void;
-}
 
 /**
  * Run the auto-review. A deny outcome means the caller must block the action
@@ -589,7 +636,8 @@ export async function classifyRequest(
   outerSignal: AbortSignal | undefined,
   options: ReviewOptions,
 ): Promise<ClassifierResult> {
-  const policy = options.policy ?? POLICY;
+  const cwd = req.cwd;
+  const sessionState = options.session;
 
   // 1. Deterministic REVIEW features: no model call
   const deterministicFlags = findDeterministicReviewFlags(req);
@@ -614,26 +662,35 @@ export async function classifyRequest(
   if (!model) {
     return failClosedResult("No classifier model available", "none", []);
   }
-
   const deadline = Date.now() + config.classifierTimeoutMs;
+  const abortSignal = outerSignal ?? new AbortController().signal;
 
-  // 3. Resolve API key (with timeout)
-  const authOutcome = await awaitWithDeadline(
-    ctx.modelRegistry.getApiKeyAndHeaders(model),
-    outerSignal ?? new AbortController().signal,
-    deadline,
-  );
-  if (authOutcome.status !== "value") {
-    return failClosedResult(`auth ${authOutcome.status}`, model.id, []);
+  // 3. Spawn-or-reuse the reviewer trunk
+  const key = `${model.provider}/${model.id}@${cwd}`;
+  if (sessionState.session && sessionState.key !== key) {
+    disposeReviewerSession(sessionState); // model/config changed → fresh trunk
   }
-  const auth = authOutcome.value;
-  if (!auth.ok) {
-    return failClosedResult(`auth failed: ${auth.error}`, model.id, []);
+  if (!sessionState.session) {
+    const spawnOutcome = await awaitWithDeadline(
+      spawnReviewerSession(ctx, model, cwd),
+      abortSignal,
+      deadline,
+    );
+    if (spawnOutcome.status !== "value") {
+      return failClosedResult(
+        `reviewer session spawn ${spawnOutcome.status}${spawnOutcome.status === "error" ? `: ${spawnOutcome.error instanceof Error ? spawnOutcome.error.message : String(spawnOutcome.error)}` : ""}`,
+        model.id,
+        [],
+      );
+    }
+    sessionState.session = spawnOutcome.value;
+    sessionState.key = key;
+    sessionState.lastEntryCount = 0; // fresh session → full transcript
   }
 
-  // 4. Build the review payload
+  // 4. Build the review payload (sanitized before it ever reaches a model)
   const payload = {
-    cwd: req.cwd,
+    cwd,
     governingUserRequest: req.userRequest ? sanitizeFreeText(req.userRequest) : null,
     note: req.degraded
       ? "NOTE: the shell command could not be parsed by the structural parser. Its syntax is unverified — inspect the raw text extra carefully, including escaped operators and quoted strings."
@@ -648,19 +705,11 @@ export async function classifyRequest(
     return failClosedResult("review input exceeds size limit", model.id, []);
   }
 
-  // 5. Build the review prompt (Full or Delta transcript)
+  // 5. Build the review prompt (Full or Delta of the parent transcript)
   const branch = safeGetBranch(ctx);
   const entries = collectTranscriptEntries(branch);
-
-  // Reuse the review conversation only if it is still a valid delta baseline
-  let turns = options.session.turns;
-  let isDelta = options.session.lastEntryCount > 0 && options.session.lastEntryCount <= entries.length;
-  if (isDelta && conversationSize(turns) > MAX_REVIEW_CONVERSATION_CHARS) {
-    turns = [];
-    isDelta = false;
-  }
-
-  const deltaEntries = isDelta ? entries.slice(options.session.lastEntryCount) : entries;
+  const isDelta = sessionState.lastEntryCount > 0 && sessionState.lastEntryCount <= entries.length;
+  const deltaEntries = isDelta ? entries.slice(sessionState.lastEntryCount) : entries;
   const { transcript, omitted } = renderTranscript(deltaEntries);
 
   const transcriptSection = isDelta
@@ -678,79 +727,66 @@ export async function classifyRequest(
     .filter(Boolean)
     .join("\n\n");
 
-  // 6. Run the review with retry + check loop
+  // 6. Run the review with retry (each transient failure respawns the trunk,
+  //    since a failed turn may have polluted the reviewer conversation).
   const maxAttempts = options.maxAttempts ?? 3;
-  const maxChecks = options.maxChecks ?? MAX_CHECKS_PER_REVIEW;
   const checks: string[] = [];
-
-  const conversation: ReviewTurn[] = [
-    ...turns,
-    { role: "user", text: userPrompt },
-  ];
-
-  let attempt = 1;
-  let lastError: string | null = null;
   options.onPhase?.({ kind: "start" });
 
+  let lastError: string | null = null;
+  let attempt = 1;
   while (attempt <= maxAttempts) {
-    if (Date.now() >= deadline || outerSignal?.aborted) break;
+    if (Date.now() >= deadline || abortSignal.aborted) break;
     const remainingMs = deadline - Date.now();
     if (remainingMs <= 0) break;
 
-    const result = await runReviewTurn(ctx, model, auth, policy, conversation, outerSignal, remainingMs, options.session.id);
-    if (result.status === "aborted") break;
-    if (result.status === "error") {
-      lastError = result.message;
+    if (attempt > 1) {
+      disposeReviewerSession(sessionState);
+      const respawn = await awaitWithDeadline(
+        spawnReviewerSession(ctx, model, cwd),
+        abortSignal,
+        deadline,
+      );
+      if (respawn.status !== "value") {
+        lastError = `reviewer session respawn ${respawn.status}`;
+        break;
+      }
+      sessionState.session = respawn.value;
+      sessionState.key = key;
+      sessionState.lastEntryCount = 0;
+    }
+
+    const attemptPrompt =
+      attempt > 1 && lastError
+        ? `The previous review attempt failed with: ${lastError}. Please produce a complete, valid assessment now.\n\n${userPrompt}`
+        : userPrompt;
+
+    const runOutcome = await runReviewTurn(
+      sessionState.session,
+      attemptPrompt,
+      deadline,
+      outerSignal,
+      options,
+      checks,
+    );
+    if (runOutcome.status === "aborted") break;
+    if (runOutcome.status === "timeout") {
+      lastError = "review timed out";
+      break;
+    }
+    if (runOutcome.status === "error") {
+      lastError = runOutcome.message;
       const backoffMs = Math.min(500 * 2 ** (attempt - 1), 2_000);
       if (Date.now() + backoffMs >= deadline) break;
       await new Promise((r) => setTimeout(r, backoffMs));
       attempt++;
       continue;
     }
-    if (result.status === "timeout") {
-      lastError = "review timed out";
-      break;
-    }
 
-    const text = result.text;
-
-    // Tool-use: the reviewer requested a read-only check via real tool calling
-    if (result.toolCall) {
-      if (checks.length >= maxChecks) {
-        lastError = "check limit reached";
-        break;
-      }
-      const { id, name, arguments: toolArgs } = result.toolCall;
-      const command = typeof toolArgs?.command === "string" ? toolArgs.command : "";
-      const checkResult = await runReadOnlyCheck(command);
-      checks.push(command);
-      options.onPhase?.({ kind: "check", command });
-      const checkOutcome = checkResult.ok
-        ? checkResult.output
-        : `ERROR: ${checkResult.error}`;
-      conversation.push(
-        {
-          role: "assistant",
-          text: `[tool_call ${name}] ${command}`,
-          toolCallId: id,
-          toolName: name,
-        },
-        {
-          role: "toolResult",
-          text: checkOutcome,
-          toolCallId: id,
-          toolName: name,
-          isError: !checkResult.ok,
-        },
-      );
-      continue; // same attempt, next model call
-    }
-
-    const assessment = parseGuardianAssessment(text);
-    // Commit the review conversation (with check loop) for reuse
-    options.session.turns = conversation;
-    options.session.lastEntryCount = entries.length;
-    options.session.totalChecks += checks.length;
+    const assessment = parseGuardianAssessment(runOutcome.text);
+    // Commit the delta cursor; keep the trunk for reuse.
+    sessionState.lastEntryCount = entries.length;
+    sessionState.totalChecks += checks.length;
     options.onPhase?.({ kind: "end" });
     return {
       decision: assessment.outcome,
@@ -760,12 +796,11 @@ export async function classifyRequest(
       deterministic: false,
       checks,
     };
-
-    // Note: parseGuardianAssessment always returns a valid assessment (fail-closed on
-    // malformed), so no separate malformed branch is needed here.
   }
 
-  // Fail closed on timeout / errors
+  // Fail closed on timeout / errors / abort — discard the trunk so a polluted
+  // conversation never leaks into the next review.
+  disposeReviewerSession(sessionState);
   options.onPhase?.({ kind: "end" });
   return failClosedResult(lastError ?? "review did not complete", model.id, checks);
 }
@@ -779,101 +814,6 @@ function failClosedResult(reason: string, model: string, checks: string[]): Clas
     deterministic: true,
     checks,
   };
-}
-
-interface ReviewTurnSuccess {
-  status: "value";
-  text: string;
-  /** Set when the reviewer requested a tool call (read-only check) */
-  toolCall?: { id: string; name: string; arguments: Record<string, unknown> };
-}
-
-type ReviewTurnResult =
-  | ReviewTurnSuccess
-  | { status: "error"; message: string }
-  | { status: "timeout" }
-  | { status: "aborted" };
-
-/** The single tool the reviewer may call: a read-only local-state check. */
-const REVIEW_TOOLS = [
-  {
-    name: "read_only_check",
-    description:
-      "Run a read-only command to verify local state before deciding. Allowed commands: ls, pwd, cat (one path), stat, file, wc, head, tail, find, test, git status/log/diff/show/branch/remote/rev-parse/ls-files. No writes, no network.",
-    parameters: {
-      type: "object",
-      properties: {
-        command: { type: "string", description: "The read-only command to run" },
-      },
-      required: ["command"],
-    },
-  },
-];
-
-async function runReviewTurn(
-  ctx: ExtensionContext,
-  model: NonNullable<ReturnType<ExtensionContext["modelRegistry"]["find"]>>,
-  auth: { apiKey?: string; headers?: Record<string, string>; env?: Record<string, string> },
-  policy: string,
-  conversation: ReviewTurn[],
-  outerSignal: AbortSignal | undefined,
-  remainingMs: number,
-  sessionId: string | undefined,
-): Promise<ReviewTurnResult> {
-  const timeoutController = new AbortController();
-  const timeout = setTimeout(() => timeoutController.abort(), remainingMs);
-  const signal = outerSignal
-    ? AbortSignal.any([outerSignal, timeoutController.signal])
-    : timeoutController.signal;
-
-  try {
-    const response = await completeSimple(
-      model,
-      { systemPrompt: policy, messages: buildMessages(conversation), tools: REVIEW_TOOLS },
-      {
-        apiKey: auth.apiKey,
-        headers: auth.headers,
-        env: auth.env,
-        reasoning: "low",
-        maxTokens: 512,
-        signal,
-        timeoutMs: remainingMs,
-        maxRetries: 0,
-        cacheRetention: "long",
-        // Stable session id → stable OpenAI prompt_cache_key / Anthropic session
-        // affinity, so the reused review conversation hits the prompt cache.
-        sessionId,
-      },
-    );
-    if (signal.aborted) {
-      return { status: "aborted" };
-    }
-
-    // Tool use: the reviewer asked for a read-only check
-    if (response.stopReason === "toolUse") {
-      const toolCall = response.content.find(
-        (part): part is { type: "toolCall"; id: string; name: string; arguments: Record<string, unknown> } =>
-          part.type === "toolCall",
-      );
-      if (!toolCall) return { status: "error", message: "reviewer requested a tool without a tool call" };
-      return { status: "value", text: "", toolCall: { id: toolCall.id, name: toolCall.name, arguments: toolCall.arguments } };
-    }
-    if (response.stopReason !== "stop") {
-      return { status: "timeout" };
-    }
-    const text = response.content
-      .filter((part): part is { type: "text"; text: string } => part.type === "text")
-      .map((part) => part.text)
-      .join("")
-      .trim();
-    if (!text) return { status: "error", message: "empty reviewer response" };
-    return { status: "value", text };
-  } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    return { status: "error", message };
-  } finally {
-    clearTimeout(timeout);
-  }
 }
 
 // ============================================================================
