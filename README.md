@@ -35,6 +35,11 @@ Runs permanently in **auto-review mode** (no mode switching): rule engine → de
   - Notifies you when the gate needs human attention: manual confirmation required, or the circuit breaker interrupts a turn
   - Protocol auto-detected: otty/kitty → OSC 99, Ghostty/iTerm2 → OSC 9, WezTerm/urxvt → OSC 777, unknown terminals get the otty-recommended 99→777→9 cascade; tmux gets DCS passthrough automatically
   - Non-TTY environments (rpc/print) fall back to in-app toasts; `/perm notify` sends a test notification
+- **Subagent manual-confirmation relay** (cross-session)
+  - Subagent / rpc sessions are headless (`ctx.hasUI === false`): manual confirmations used to fail closed into automatic denials
+  - Headless sessions now broadcast the confirmation request to any UI-capable session in the same process (the interactive parent), which renders the same permission dialog (with a `from subagent …` origin line) and relays the user's choice back
+  - Fail-closed everywhere: probe timeout (2s) when no UI session exists, response timeout (120s) when the user never answers
+  - Nested subagents work with no forwarding — the request broadcast reaches the interactive parent at any depth
 - **Status display**: persistent footer `🔒 menshen ✓n ✗n ⚠n` stats
 
 ## Install
@@ -75,6 +80,11 @@ Config file: `~/.pi/pi-menshen.json` (directory overridable via `PI_MENSHEN_DIR`
     "onManualPrompt": true,
     "onBreakerTrip": true,
     "protocol": "auto"
+  },
+  "relay": {
+    "enabled": true,
+    "probeTimeoutMs": 2000,
+    "responseTimeoutMs": 120000
   },
   "rules": {
     "allow": ["Bash(npm run:*)"],
@@ -149,6 +159,44 @@ tool call
   └─ 5. Manual confirmation (only when the reviewer could not decide)
          (allow / deny / deny and remember)
 ```
+
+## Subagent manual-confirmation relay
+
+Subagent (and rpc/print) sessions are headless — `ctx.hasUI === false`. Previously any manual decision needed inside a subagent (`ask` rules, reviewer timeout/failure, deterministic high-risk signals) failed closed into an automatic denial, invisibly to the user.
+
+Headless sessions now broadcast the confirmation request over a process-wide channel to any UI-capable session (the interactive parent):
+
+```
+subagent (headless)                        main session (interactive)
+────────────────────                       ─────────────────────────────
+tool call needs manual confirmation
+  │ emit manual-request ─────────────────► dedup, emit manual-ack
+  │                                        (no ack within 2s probe → deny)
+  │                                        ├─ terminal notification
+  │                                        ├─ permission dialog (from subagent Explore#ab12)
+  │ ◄────────────────────────────────────── user choice (allow / deny / deny & remember / reason)
+  │ emit manual-response
+  │ allow or deny (with rationale + no-bypass guidance)
+  └─ every timeout path fails closed → deny
+```
+
+- Reuses the same permission dialog, plus a `from <subagent>` origin line and a terminal notification
+- Nested subagents work with no forwarding: the broadcast reaches the interactive parent at any depth
+- `deny & remember` persists the rule in both sessions (`~/.pi/pi-menshen.json`); the parent's in-memory rule set is kept in sync
+- Fully headless setups (rpc/print, no UI session) still fail closed after the probe window — never hangs
+- Subagent denials count against the subagent's own circuit breaker, never the parent's
+
+Config (defaults are fine):
+
+```json
+"relay": {
+  "enabled": true,
+  "probeTimeoutMs": 2000,      // max time to wait for a UI session to pick up (ms)
+  "responseTimeoutMs": 120000  // max time to wait for the user's choice (ms); timeout = deny
+}
+```
+
+> Note: the relay channel is a tiny process-wide bus on `globalThis` (subagents run in the same process as the parent); pi's own `pi.events` bus is per-session and cannot reach the parent.
 
 ## Security notes
 

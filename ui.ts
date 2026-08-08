@@ -165,6 +165,8 @@ export interface PermissionDialogData {
   rationale?: string;
   /** Fallback note when no assessment is available (rule ask / review unavailable) */
   note?: string;
+  /** Origin label when this decision was relayed from another session (e.g. a subagent) */
+  sourceLabel?: string;
 }
 
 interface ChoiceDef {
@@ -246,6 +248,11 @@ export class PermissionDialog implements Component {
 
     // Tool row
     lines.push(inner(`${theme.fg("dim", "tool")}  ${theme.fg("text", theme.bold(truncatePlain(data.toolName, Math.max(4, boxInner - 8))))}`));
+
+    // Relay origin (subagent request), shown above the preview
+    if (data.sourceLabel) {
+      lines.push(inner(`${theme.fg("dim", "from")}  ${theme.fg("warning", truncatePlain(data.sourceLabel, Math.max(4, boxInner - 8)))}`));
+    }
 
     lines.push(inner(""));
 

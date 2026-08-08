@@ -54,6 +54,15 @@ import {
   type ReviewerSessionState,
 } from "./classifier.ts";
 import {
+  getRelayBus,
+  newRelayRequestId,
+  RELAY_CHANNEL_ACK,
+  RELAY_CHANNEL_REQUEST,
+  RELAY_CHANNEL_RESPONSE,
+  relayManualRequest,
+  type RelayManualRequest,
+} from "./relay.ts";
+import {
   detectNotifyProtocol,
   sendTerminalNotification,
 } from "./notify.ts";
@@ -97,6 +106,10 @@ interface SessionState {
   reviewer: ReviewerSessionState;
   /** Rejection circuit breaker: turnId → counters */
   circuitBreaker: Map<string, { consecutive: number; recent: Array<boolean> }>;
+  /** Latest ExtensionContext (used to answer relayed manual prompts when this session has UI) */
+  ctx: ExtensionContext | null;
+  /** Session label for relay origin display (e.g. "Explore#ab12cd" in a subagent) */
+  sessionLabel: string;
 }
 
 // ============================================================================
@@ -179,7 +192,7 @@ async function decideToolCall(
     case "ask": {
       const note = `Rule requires manual confirmation: ${ruleResult.rule}`;
       notifyAttention(ctx, state, "manual", `${toolName}(${truncateUi(matchKey, 60)})`);
-      const manual = await promptManual(ctx, toolName, args, matchKey, { note });
+      const manual = await promptManual(ctx, state, toolName, args, matchKey, { note });
       return finalizeManual(ctx, state, toolName, args, manual, false, note);
     }
     case "allow":
@@ -284,7 +297,7 @@ async function decideToolCall(
   // ---------- 5. Manual confirmation (reviewer could not decide / deterministic REVIEW) ----------
   const note = manualNote(classifierResult);
   notifyAttention(ctx, state, "manual", `${toolName}(${truncateUi(matchKey, 60)})`);
-  const manual = await promptManual(ctx, toolName, args, matchKey, {
+  const manual = await promptManual(ctx, state, toolName, args, matchKey, {
     note,
     assessment: classifierResult.classifierUsed ? classifierResult.assessment : undefined,
   });
@@ -394,15 +407,162 @@ function finalizeManual(
   return { action: "block", channel: "manual", reason, classifierUsed };
 }
 
+/**
+ * Relay a manual-confirmation request from a headless session (subagent / rpc)
+ * to a UI-capable session in the same process (the interactive parent).
+ * Returns undefined when relaying is disabled, no UI session picks it up within
+ * the probe window, the user never answers within the response window, or the
+ * turn is aborted — every path fails closed (caller denies).
+ */
+async function requestRelayedManual(
+  ctx: ExtensionContext,
+  state: SessionState,
+  toolName: string,
+  args: Record<string, unknown>,
+  matchKey: string,
+  info: { note: string; assessment?: GuardianAssessment },
+): Promise<ManualDecision | undefined> {
+  const relay = state.config.relay;
+  if (!relay?.enabled) return undefined;
+
+  const bus = getRelayBus();
+  const request: RelayManualRequest = {
+    requestId: newRelayRequestId(),
+    sourceLabel: state.sessionLabel ? `subagent ${state.sessionLabel}` : "headless session",
+    toolName,
+    preview: summarizeInput(matchKey, args),
+    risk: info.assessment?.risk_level,
+    authorization: info.assessment?.user_authorization,
+    rationale: info.assessment?.rationale,
+    note: info.note,
+    suggestedRule: suggestRule(toolName, args),
+  };
+
+  // Single round-trip: subscribe before emitting (no race), fail closed when no
+  // UI session picks the request up (probe window) or the user never answers
+  // (response window), or the turn is aborted.
+  const response = await relayManualRequest(
+    bus,
+    request,
+    relay.probeTimeoutMs,
+    relay.responseTimeoutMs,
+    ctx.signal,
+  );
+  if (!response) return undefined;
+
+  switch (response.action) {
+    case "allow":
+      return { action: "allow" };
+    case "deny-remember":
+      return { action: "deny-remember" };
+    default:
+      return { action: "deny", userReason: response.userReason };
+  }
+}
+
+/**
+ * Answer relayed manual-confirmation requests on behalf of a UI-capable session
+ * (the interactive parent). Every session's menshen instance subscribes; only
+ * the one with UI responds, so the broadcast reaches the parent regardless of
+ * subagent nesting depth. Returns an unsubscribe function.
+ */
+function installRelayResponder(getState: () => SessionState | undefined): () => void {
+  const bus = getRelayBus();
+  return bus.on(RELAY_CHANNEL_REQUEST, (payload) => {
+    // Fire-and-forget: the requester's probe/response timeouts guard against hangs.
+    void handleRelayRequest(getState, payload as RelayManualRequest).catch(() => {
+      // Responder failure → requester times out → fail-closed deny.
+    });
+  });
+}
+
+/** Serializes relayed dialogs so concurrent requests cannot fight over the editor area. */
+let relayDialogQueue: Promise<void> = Promise.resolve();
+
+async function handleRelayRequest(
+  getState: () => SessionState | undefined,
+  request: RelayManualRequest,
+): Promise<void> {
+  const state = getState();
+  if (!state) return;
+  const ctx = state.ctx;
+  if (!ctx || !ctx.hasUI) return; // only an interactive session answers
+
+  const bus = getRelayBus();
+  // Dedup across instances: if another UI session already claimed this request,
+  // do not show a second dialog.
+  if (!bus.claimRequest(request.requestId)) return;
+  try {
+    // Acknowledge so the requester knows a human will see this.
+    bus.emit(RELAY_CHANNEL_ACK, { requestId: request.requestId });
+    notifyAttention(
+      ctx,
+      state,
+      "manual",
+      `${request.toolName}(${truncateUi(request.preview, 60)}) — from ${request.sourceLabel}`,
+    );
+
+    // Serialize concurrent relayed dialogs: two `ctx.ui.custom` renders at the
+    // same time would fight over the editor area. Queued requests simply wait;
+    // the requester's own response timeout still bounds the wait.
+    const run = relayDialogQueue.then(() =>
+      showPermissionDialog(ctx, {
+        toolName: request.toolName,
+        preview: request.preview,
+        risk: request.risk,
+        authorization: request.authorization,
+        rationale: request.rationale,
+        note: request.note,
+        sourceLabel: request.sourceLabel,
+      }),
+    );
+    // Advance the chain after THIS dialog closes, so the next request is shown next.
+    relayDialogQueue = run.then(() => undefined, () => undefined);
+    const choice = await run;
+
+    switch (choice) {
+      case "allow":
+        bus.emit(RELAY_CHANNEL_RESPONSE, { requestId: request.requestId, action: "allow" });
+        return;
+      case "deny-remember":
+        // The requester persists the rule too (same config file); keeping our own
+        // in-memory rule set in sync avoids a stale gate for later parent calls.
+        if (request.suggestedRule) addRuleToGlobal(state, "deny", request.suggestedRule);
+        bus.emit(RELAY_CHANNEL_RESPONSE, { requestId: request.requestId, action: "deny-remember" });
+        return;
+      case "deny-reason": {
+        const reason = await ctx.ui.input("Reason for denial (Enter to skip):", "");
+        bus.emit(RELAY_CHANNEL_RESPONSE, {
+          requestId: request.requestId,
+          action: "deny",
+          userReason: typeof reason === "string" && reason.trim() ? reason.trim() : undefined,
+        });
+        return;
+      }
+      default:
+        // "deny" or null (esc / cancel) → deny
+        bus.emit(RELAY_CHANNEL_RESPONSE, { requestId: request.requestId, action: "deny" });
+    }
+  } finally {
+    bus.releaseRequest(request.requestId);
+  }
+}
+
 async function promptManual(
   ctx: ExtensionContext,
+  state: SessionState,
   toolName: string,
   args: Record<string, unknown>,
   matchKey: string,
   info: { note: string; assessment?: GuardianAssessment },
 ): Promise<ManualDecision> {
   if (!ctx.hasUI) {
-    return { action: "deny" }; // Non-interactive mode fail-safe: deny
+    // Headless session (subagent / rpc / print): a dialog cannot be shown here.
+    // Relay the decision to a UI-capable session (the interactive parent), if
+    // any is reachable. Every timeout/unavailable path fails closed (deny).
+    const relayed = await requestRelayedManual(ctx, state, toolName, args, matchKey, info);
+    if (relayed) return relayed;
+    return { action: "deny" }; // Non-interactive fail-safe: deny
   }
   const preview = summarizeInput(matchKey, args);
   const choice = await showPermissionDialog(ctx, {
@@ -605,6 +765,10 @@ function findLatestUserRequest(ctx: ExtensionContext): string | null {
 export default function piPermission(pi: ExtensionAPI): void {
   let state: SessionState | undefined;
 
+  // Answer relayed manual prompts from headless sessions (subagents). Every
+  // session's instance subscribes; only the UI-capable one actually responds.
+  const offRelayResponder = installRelayResponder(() => state);
+
   const refreshState = (ctx: ExtensionContext): SessionState => {
     const next: SessionState = {
       config: loadConfig(),
@@ -614,6 +778,8 @@ export default function piPermission(pi: ExtensionAPI): void {
       userRequest: findLatestUserRequest(ctx),
       reviewer: createReviewerSession(),
       circuitBreaker: new Map(),
+      ctx,
+      sessionLabel: pi.getSessionName() ?? "",
     };
     rebuildRuleSet(next);
     return next;
@@ -621,10 +787,12 @@ export default function piPermission(pi: ExtensionAPI): void {
 
   pi.on("session_start", (_event, ctx) => {
     state = refreshState(ctx);
+    state.ctx = ctx;
     ctx.ui.setStatus("perm", statusSummary(ctx.ui.theme, state.stats, state.config.enabled));
   });
 
   pi.on("session_shutdown", () => {
+    offRelayResponder();
     state = undefined;
   });
 
@@ -636,6 +804,7 @@ export default function piPermission(pi: ExtensionAPI): void {
 
     // Re-resolve the governing request at call time to stay current
     current.userRequest = findLatestUserRequest(ctx);
+    current.ctx = ctx;
 
     const decision = await decideToolCall(ctx, current, event);
 
@@ -661,6 +830,7 @@ export default function piPermission(pi: ExtensionAPI): void {
     handler: async (args, ctx) => {
       const current = state ?? refreshState(ctx);
       state = current;
+      current.ctx = ctx;
 
       const parts = (args ?? "").trim().split(/\s+/).filter(Boolean);
       const sub = parts[0]?.toLowerCase();

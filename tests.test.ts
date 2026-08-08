@@ -2,7 +2,7 @@
  * Smoke tests for the rule engine and bash analysis (incl. tree-sitter integration).
  * Run: npm test
  */
-import { describe, it } from "node:test";
+import { beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
@@ -682,5 +682,118 @@ describe("notify emission", () => {
     assert.equal(writes.length, 2);
     assert.ok(writes[0]!.startsWith("\x1bPtmux;"));
     assert.ok(writes[1]!.startsWith("\x1bPtmux;"));
+  });
+});
+
+// ============================================================================
+// Cross-session manual-confirmation relay (relay.ts)
+// ============================================================================
+
+import {
+  createRelayBus,
+  getRelayBus,
+  resetRelayBusForTests,
+  relayManualRequest,
+  RELAY_CHANNEL_ACK,
+  RELAY_CHANNEL_REQUEST,
+  RELAY_CHANNEL_RESPONSE,
+  type RelayManualRequest,
+} from "./relay.ts";
+
+const makeRequest = (requestId = "r1"): RelayManualRequest => ({
+  requestId,
+  sourceLabel: "subagent Explore#ab12",
+  toolName: "bash",
+  preview: "rm -rf /",
+  note: "review unavailable; manual review required",
+  suggestedRule: "Bash(rm:*)",
+});
+
+describe("cross-session manual relay", () => {
+  beforeEach(() => resetRelayBusForTests());
+
+  it("round-trips a manual decision from a headless session to a UI session", async () => {
+    const bus = getRelayBus();
+    const request = makeRequest();
+
+    // UI-capable responder: claims, acks, then the "user" picks allow.
+    bus.on(RELAY_CHANNEL_REQUEST, (payload) => {
+      const req = payload as RelayManualRequest;
+      if (!bus.claimRequest(req.requestId)) return;
+      bus.emit(RELAY_CHANNEL_ACK, { requestId: req.requestId });
+      bus.emit(RELAY_CHANNEL_RESPONSE, { requestId: req.requestId, action: "allow" });
+    });
+
+    const response = await relayManualRequest(bus, request, 100, 100);
+    assert.deepEqual(response, { requestId: "r1", action: "allow" });
+  });
+
+  it("does not miss a synchronous response (no subscribe race)", async () => {
+    const bus = getRelayBus();
+    const request = makeRequest("r-sync");
+    // Responder answers synchronously inside the request broadcast, before the
+    // requester would ever get a chance to subscribe to the response channel.
+    bus.on(RELAY_CHANNEL_REQUEST, (payload) => {
+      const req = payload as RelayManualRequest;
+      bus.emit(RELAY_CHANNEL_RESPONSE, { requestId: req.requestId, action: "deny" });
+    });
+
+    const response = await relayManualRequest(bus, request, 100, 100);
+    assert.deepEqual(response, { requestId: "r-sync", action: "deny" });
+  });
+
+  it("fails closed when no UI session picks up the request (probe timeout)", async () => {
+    const bus = getRelayBus();
+    const response = await relayManualRequest(bus, makeRequest(), 30, 100);
+    assert.equal(response, undefined);
+  });
+
+  it("fails closed when the user never answers (response timeout)", async () => {
+    const bus = getRelayBus();
+    // Responder acks (so the probe succeeds) but never answers.
+    bus.on(RELAY_CHANNEL_REQUEST, (payload) => {
+      const req = payload as RelayManualRequest;
+      bus.emit(RELAY_CHANNEL_ACK, { requestId: req.requestId });
+    });
+    const response = await relayManualRequest(bus, makeRequest(), 100, 30);
+    assert.equal(response, undefined);
+  });
+
+  it("fails closed on abort signal", async () => {
+    const bus = getRelayBus();
+    const ac = new AbortController();
+    ac.abort();
+    const response = await relayManualRequest(bus, makeRequest(), 200, 200, ac.signal);
+    assert.equal(response, undefined);
+  });
+
+  it("deduplicates concurrent requests across sessions", () => {
+    const bus = getRelayBus();
+    assert.equal(bus.claimRequest("r9"), true);
+    assert.equal(bus.claimRequest("r9"), false); // already claimed
+    bus.releaseRequest("r9");
+    assert.equal(bus.claimRequest("r9"), true); // claimable again after release
+  });
+
+  it("only one of two UI sessions answers the same request", async () => {
+    const bus = createRelayBus(); // isolated bus, deterministic
+    const answers: string[] = [];
+    bus.on(RELAY_CHANNEL_REQUEST, (payload) => {
+      const req = payload as RelayManualRequest;
+      if (!bus.claimRequest(req.requestId)) return;
+      answers.push("session-a");
+      bus.emit(RELAY_CHANNEL_ACK, { requestId: req.requestId });
+      bus.emit(RELAY_CHANNEL_RESPONSE, { requestId: req.requestId, action: "deny" });
+    });
+    bus.on(RELAY_CHANNEL_REQUEST, (payload) => {
+      const req = payload as RelayManualRequest;
+      if (!bus.claimRequest(req.requestId)) return;
+      answers.push("session-b"); // must never run
+      bus.emit(RELAY_CHANNEL_RESPONSE, { requestId: req.requestId, action: "allow" });
+    });
+
+    const response = await relayManualRequest(bus, makeRequest("r2"), 100, 100);
+    assert.deepEqual(response, { requestId: "r2", action: "deny" });
+    assert.deepEqual(answers, ["session-a"]);
   });
 });

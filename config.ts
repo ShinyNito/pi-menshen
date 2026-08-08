@@ -49,6 +49,20 @@ export interface NotificationConfig {
   protocol: "auto" | "osc99" | "osc9" | "osc777" | "cascade";
 }
 
+/** Cross-session manual-confirmation relay (subagent → parent session) */
+export interface RelayConfig {
+  /**
+   * Master switch. When a headless session (subagent / rpc) needs a manual
+   * decision, relay the request to a UI-capable session (the interactive
+   * parent) instead of instantly denying.
+   */
+  enabled: boolean;
+  /** How long a headless session waits for a UI session to pick up the request (ms) */
+  probeTimeoutMs: number;
+  /** How long a headless session waits for the user's choice before failing closed (ms) */
+  responseTimeoutMs: number;
+}
+
 /** Guardian auto-review settings (model-review layer) */
 export interface GuardianConfig {
   /**
@@ -104,6 +118,8 @@ export interface PermissionConfig {
   guardian: GuardianConfig;
   /** Terminal notifications (OSC) settings */
   notifications: NotificationConfig;
+  /** Cross-session manual-confirmation relay (subagent → parent) */
+  relay: RelayConfig;
   /** Permission rules */
   rules: RulesSection;
 }
@@ -158,6 +174,11 @@ export const DEFAULT_CONFIG: PermissionConfig = {
     onManualPrompt: true,
     onBreakerTrip: true,
     protocol: "auto",
+  },
+  relay: {
+    enabled: true,
+    probeTimeoutMs: 2_000,
+    responseTimeoutMs: 120_000,
   },
   rules: { allow: [], deny: [], ask: [] },
 };
@@ -226,6 +247,10 @@ export function loadConfig(): PermissionConfig {
     notifications: {
       ...DEFAULT_CONFIG.notifications,
       ...stored.notifications,
+    },
+    relay: {
+      ...DEFAULT_CONFIG.relay,
+      ...stored.relay,
     },
     rules: {
       ...defaultRulesSection(),

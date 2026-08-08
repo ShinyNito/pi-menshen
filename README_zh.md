@@ -35,6 +35,11 @@
   - 需要人工确认、或熔断中断 turn 时,向终端发通知(otty/kitty 显示为 macOS 原生横幅)
   - 自动检测终端协议:otty/kitty → OSC 99,Ghostty/iTerm2 → OSC 9,WezTerm/urxvt → OSC 777,未知终端按 otty 推荐级联 99→777→9;tmux 内自动 DCS 透传
   - 非 TTY 环境(rpc/print)自动回落为应用内提示;`/perm notify` 可发测试通知
+- **subagent 人工确认 relay**(跨会话)
+  - 子会话(subagent / rpc)没有 UI,原本「需要人工确认」只能 fail-closed 自动拒绝
+  - 现在 headless 会话会把确认请求**广播到同一进程内的 UI 会话**(交互式主会话),在主会话弹出同一个确认面板(带来源标注,如 `from subagent Explore#ab12`),用户的选择经应答通道回传给子 agent
+  - 无 UI 会话可应答时,探测超时(默认 2s)后依旧 fail-closed 拒绝;用户未在应答窗口(默认 120s)内作答同样拒绝
+  - 嵌套 subagent(子再派子)天然支持:请求广播到所有会话,由交互式主会话应答
 - **状态显示**:footer 常驻 `🔒 menshen ✓n ✗n ⚠n` 统计
 
 ## 安装
@@ -95,6 +100,11 @@ GitHub release 下载到 `~/.pi/`。
     "onManualPrompt": true,
     "onBreakerTrip": true,
     "protocol": "auto"
+  },
+  "relay": {
+    "enabled": true,
+    "probeTimeoutMs": 2000,
+    "responseTimeoutMs": 120000
   },
   "rules": {
     "allow": ["Bash(npm run:*)"],
@@ -173,11 +183,49 @@ GitHub release 下载到 `~/.pi/`。
 ## 终端通知(otty 等)
 
 需要人工确认、或熔断中断 turn 时,门神会向终端发一条通知。在 otty 中这表现为 macOS 原生横幅(需要在系统设置 → 通知 → otty 中开启权限)。
-
 - **协议自动检测**:otty/kitty → OSC 99,Ghostty/iTerm2 → OSC 9,WezTerm/urxvt/Windows Terminal → OSC 777,未知终端按 otty 官方推荐级联 99→777→9;tmux 内自动 DCS 透传
 - **测试**:`/perm notify` 发一条测试通知;`/perm notify on|off` 开关
 - **配置**:`notifications.enabled` 总开关;`onManualPrompt` / `onBreakerTrip` 分别控制两个触发点;`protocol` 可固定为 `osc99`/`osc9`/`osc777`/`cascade`(默认 `auto` 自动检测)
 - **降级**:rpc/print 等非 TTY 环境下无法发 OSC,自动改为应用内提示
+
+## subagent 人工确认 relay
+
+subagent(以及 rpc/print 会话)没有 UI:`ctx.hasUI === false`。原本 headless 会话遇到「需要人工确认」只能 fail-closed 直接拒绝——`ask` 规则、审核超时/失败、确定性高风险信号都会变成自动 deny,用户完全无感知。
+
+现在 headless 会话会把确认请求**广播到同一进程内的 UI 会话**(通常是交互式主会话):
+
+```
+subagent(headless)                  主会话(交互式)
+────────────────────                ────────────────────
+工具调用需要人工确认
+  │ emit manual-request ───────────► 收到请求(去重后)
+  │                                  │ emit manual-ack(2s 探测内未收到 ack → 直接拒绝)
+  │                                  ├─ 终端通知「需要人工确认」
+  │                                  ├─ 弹出确认面板(标注 from subagent Explore#ab12)
+  │ ◄───────────────────────────────┘ 用户选择(allow / deny / deny & remember / 带理由拒绝)
+  │ emit manual-response
+  │ 按用户选择放行/拒绝(拒绝含理由与禁止绕过指引)
+  └─ 所有超时路径 fail-closed → deny
+```
+
+要点:
+- **确认面板复用同一套 UI**,只是多了一行 `from <subagent>` 来源标注,并触发终端通知
+- **嵌套 subagent 天然支持**:请求广播到进程内所有会话,由交互式主会话应答,无需逐层转发
+- **`deny & remember`** 规则在双方会话都会持久化(`~/.pi/pi-menshen.json`),主会话内存规则集同步刷新
+- **完全 headless 环境**(rpc/print 无 UI 会话)探测超时后照旧 fail-closed 拒绝,不会挂起
+- 子 agent 拒绝次数计入子会话自己的熔断器,不会误触主会话熔断
+
+配置(可全部保持默认):
+
+```json
+"relay": {
+  "enabled": true,
+  "probeTimeoutMs": 2000,      // 等 UI 会话接单的最长时间(ms)
+  "responseTimeoutMs": 120000  // 等用户作答的最长时间(ms),超时拒绝
+}
+```
+
+> 注:relay 通道是挂在 `globalThis` 上的进程级迷你总线(subagent 与主会话同进程),不依赖 pi 的 `pi.events`(该总线按会话隔离,跨不到父会话)。
 
 ## 开发
 

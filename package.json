@@ -21,6 +21,7 @@
     "bash.ts",
     "parser.ts",
     "classifier.ts",
+    "relay.ts",
     "notify.ts",
     "ui.ts",
     "config.ts",
